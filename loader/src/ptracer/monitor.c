@@ -605,8 +605,12 @@ void sigchld_listener_callback() {
     int pid;
     while ((pid = waitpid(-1, &sigchld_status, __WALL | WNOHANG)) != 0) {
       if (pid == -1) {
-        if (tracing_state == STOPPED && errno == ECHILD) break;
-        PLOGE("waitpid");
+        /* ECHILD only means the current queue is drained.  The domainless
+           monitor does not keep PID 1 seized, so this is the normal state
+           after a short-lived daemon/tracer child exits.  Falling through
+           with pid == -1 would spin forever and misclassify it as a child. */
+        if (errno != ECHILD) PLOGE("waitpid");
+        break;
       }
 
       if (pid == 1) {
@@ -935,7 +939,7 @@ static bool update_status(const char *message) {
 
     fclose(json);
   } else {
-    if (remove("/data/adb/rezygisk/state.json") == -1) {
+    if (remove("/data/adb/rezygisk/state.json") == -1 && errno != ENOENT) {
       PLOGE("failed to remove state.json");
     }
   }
@@ -1091,6 +1095,19 @@ static bool domainless_read_identity(pid_t pid, uid_t *uid, pid_t *ppid) {
   return found_uid && found_ppid;
 }
 
+static bool domainless_read_program(pid_t pid, char *program, size_t size) {
+  if (size == 0) return false;
+
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+
+  ssize_t length = readlink(path, program, size - 1);
+  if (length < 0 || (size_t)length >= size) return false;
+
+  program[length] = '\0';
+  return true;
+}
+
 static bool domainless_target_seen(pid_t pid) {
   for (size_t i = 0; i < DOMAINLESS_MAX_TARGETS; i++) {
     if (domainless_targets[i] == pid) return true;
@@ -1208,7 +1225,9 @@ static void domainless_scan_proc(int broker_fd) {
     if (domainless_target_seen(pid)) continue;
 
     char program[PATH_MAX];
-    if (get_program(pid, program, sizeof(program)) == -1) continue;
+    /* Kernel threads and processes racing with exit have no readable exe.
+       That is expected during /proc discovery and must not flood logcat. */
+    if (!domainless_read_program(pid, program, sizeof(program))) continue;
 
     domainless_consider_target(broker_fd, pid, program);
   }
@@ -1217,6 +1236,30 @@ static void domainless_scan_proc(int broker_fd) {
 }
 
 static bool domainless_prepare_runtime() {
+  const char *path = getenv("PATH");
+  if (path == NULL || strstr(path, "/data/adb/ap/bin") == NULL) {
+    static const char apatch_path[] = "/data/adb/ap/bin";
+    static const char android_path[] =
+      "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:"
+      "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin";
+
+    size_t path_length = sizeof(apatch_path) + (path && *path ? strlen(path) : strlen(android_path)) + 1;
+    char *domainless_path = malloc(path_length);
+    if (domainless_path == NULL) {
+      PLOGE("allocate APatch domainless PATH");
+      return false;
+    }
+
+    snprintf(domainless_path, path_length, "%s:%s", apatch_path,
+             path && *path ? path : android_path);
+    if (setenv("PATH", domainless_path, 1) == -1) {
+      PLOGE("set APatch domainless PATH");
+      free(domainless_path);
+      return false;
+    }
+    free(domainless_path);
+  }
+
   const char *runtime = "/data/adb/rezygisk";
   if (mkdir(runtime, 0555) == -1 && errno != EEXIST) {
     PLOGE("create domainless runtime");
@@ -1250,6 +1293,11 @@ void init_domainless_monitor() {
     domainless_expect64 = access(APP_PROCESS_64, X_OK) == 0;
     domainless_expect32 = access(APP_PROCESS_32, X_OK) == 0;
   }
+
+  /* Report every ABI advertised by ro.zygote from the first status update.
+     Daemon startup remains lazy for the non-native ABI. */
+  status64.supported = domainless_expect64;
+  status32.supported = domainless_expect32;
 
   if (!domainless_prepare_runtime() || !prepare_environment()) exit(1);
   if (!rezygiskd_listener_init()) exit(1);

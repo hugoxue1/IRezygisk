@@ -214,6 +214,44 @@ APatch 的空 `package_config` 是合法 0 条配置。IRezygisk 必须把空文
 7. ZIP 同时携带 32/64 entry 声明，但单 ABI 设备不会提取另一套二进制；安装脚本必须按实际 ABI 删除
    未安装的 manifest entry，否则 APatch 的 fail-closed 路径审计会正确禁用整个 early loader。
 
-构建状态：2026-08-14 已在 Android API 25 目标上完整清理构建通过 arm64-v8a、armeabi-v7a、x86、
-x86_64；代码编译通过不等于真机通过。APatch 19067 + IRezygisk 的无模块、单模块、ckbsmart、Assistant、
-Hunter 和三次冷启动门禁仍待用户刷入后验证，在此之前不得标为稳定版。
+8. APatch early-loader 由 init/APD 直接派生，不经过模块 `post-fs-data.sh`；其继承的 `PATH` 不保证包含
+   `/data/adb/ap/bin`。ReZygisk 的 APatch root backend 会先验证该目录是否在 `PATH`，即使随后用绝对路径
+   `/data/adb/apd` 执行也会提前拒绝。domainless monitor 必须在启动 daemon 前补入 APatch bin，同时保留
+   原 Android PATH；不能删除 root backend 的环境校验来掩盖启动契约缺失。
+9. domainless monitor 不 seize PID 1，短命 daemon/tracer 子进程退出后 `waitpid(-1, ..., WNOHANG)` 返回
+   `ECHILD` 是正常的“当前队列已排空”。旧 listener 只在 `STOPPED` 时 break，会在 `TRACING` 下拿
+   `pid=-1` 继续循环，造成 CPU/日志风暴并永远无法扫描 Zygote。所有 `waitpid` 错误都必须结束本次排空；
+   非 `ECHILD` 错误另行记录。
+10. `/proc` 枚举会遇到没有 `exe` 的内核线程和正在退出的进程。通用 `get_program()` 会把每次预期的
+    `ENOENT` 写入日志，不适合高频 discovery；domainless scanner 使用静默 `readlink`，只把真实协议、
+    daemon 和注入失败写入日志。
+11. 状态展示不能以“该 ABI 的 daemon 已经 fork”为设备支持判据。`zygote64_32` 设备从首个状态更新就
+    应同时显示 64/32，未注入时均为警告；只有收到对应 `ZYGOTE*_INJECTED` 且 daemon 存活才显示成功。
+
+### 9.1 `v1.0.0-i1` 首次真机失败与 `i2` 修复
+
+MI 9（Android 11，`ro.zygote=zygote64_32`）安装 APatch 19067 与 IRezygisk
+`v1.0.0-i1-538-939ab21-release` 后能够进入系统，但模块卡片只显示
+`Monitor: ✅, ReZygisk 64-bit: ⚠️`，没有 32 位状态。只读 ADB 取证确认两个 Zygote 均存在，
+`zygisk-ptrace32/64` 与 `zygiskd32/64` 文件也完整，但没有 monitor/daemon 常驻，Zygote maps 未注入。
+
+持久日志给出直接证据：
+
+```text
+zygiskd64: APatch's APD binary is not in PATH
+zygiskd64: No root implementation found.
+zygiskd64: Unsupported environment: Unknown root implementation
+zygisk-ptrace64: waitpid failed with 10: No child processes
+zygisk-ptrace64: process -1 received unknown sigchld_status ...
+```
+
+同时出现大量 `/proc/<kernel-thread>/exe: ENOENT`。这不是单纯 UI 问题，而是三段连续故障：APatch
+环境未满足 backend 检查，64 位 daemon 退出；listener 随后在 `ECHILD` 上死循环；32 位发现和两种 ABI
+注入均不再发生。`i2` 在 monitor 侧补齐 PATH、修正 waitpid 排空、静默预期 `/proc` 竞态，并按
+`ro.zygote` 预置 ABI 展示。修复不修改 APatch/KernelPatch ABI、不增加 live-policy，也不触碰设备；用户
+安装新 ZIP 后仍须重启并以进程、state.json、32/64 maps 和实际模块功能联合验收。
+
+构建状态：`i1` 已在 Android API 25 目标上完整清理构建通过 arm64-v8a、armeabi-v7a、x86、x86_64，
+但首次真机失败；`i2` 修复后必须重新完成同一四 ABI 构建。代码编译通过不等于真机通过。APatch 19067 +
+IRezygisk 的单模块 32/64 注入、ckbsmart、Assistant、Hunter 和三次冷启动门禁仍待验证，在此之前不得
+标为稳定版。
