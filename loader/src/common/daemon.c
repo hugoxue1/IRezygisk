@@ -2,9 +2,15 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdatomic.h>
 
+#include <linux/futex.h>
 #include <linux/un.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 
 #include "logging.h"
 #include "misc.h"
@@ -13,8 +19,81 @@
 #include "daemon.h"
 
 #define SOCKET_FILE_NAME LP_SELECT("cp32", "cp64") ".sock"
+#define DOMAINLESS_MARKER "/data/adb/modules/rezygisk/.apatch-domainless-v1"
+
+struct domainless_channel {
+  _Atomic int owner;
+};
+
+static struct domainless_channel *domainless_channel = NULL;
+static int domainless_session_fd = -1;
+static bool domainless_session_released = false;
+
+static int domainless_futex_wait(_Atomic int *address, int expected) {
+  return syscall(SYS_futex, (int *)address, FUTEX_WAIT, expected, NULL, NULL, 0);
+}
+
+static void domainless_futex_wake(_Atomic int *address) {
+  syscall(SYS_futex, (int *)address, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+static bool domainless_lock() {
+  if (domainless_channel == NULL) return false;
+
+  for (;;) {
+    int self = (int)syscall(SYS_gettid);
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&domainless_channel->owner, &expected, self,
+                                                memory_order_acquire, memory_order_relaxed)) {
+      return true;
+    }
+
+    int owner = atomic_load_explicit(&domainless_channel->owner, memory_order_acquire);
+    if (owner > 1 && kill(owner, 0) == -1 && errno == ESRCH) {
+      expected = owner;
+      if (atomic_compare_exchange_strong_explicit(&domainless_channel->owner, &expected, 0,
+                                                  memory_order_acq_rel, memory_order_relaxed)) {
+        domainless_futex_wake(&domainless_channel->owner);
+      }
+      continue;
+    }
+
+    if (domainless_futex_wait(&domainless_channel->owner, owner) == -1 &&
+        errno != EAGAIN && errno != EINTR) {
+      PLOGE("domainless channel futex wait");
+      return false;
+    }
+  }
+}
+
+static void domainless_unlock() {
+  if (domainless_channel == NULL) return;
+
+  atomic_store_explicit(&domainless_channel->owner, 0, memory_order_release);
+  domainless_futex_wake(&domainless_channel->owner);
+}
+
+static void rezygiskd_disconnect(int fd) {
+  close(fd);
+  if (domainless_session_fd >= 0 && domainless_channel != NULL) {
+    domainless_unlock();
+  }
+}
 
 static int rezygiskd_connect(uint8_t retry) {
+  if (domainless_session_released) return -1;
+
+  if (domainless_session_fd >= 0) {
+    if (!domainless_lock()) return -1;
+
+    int fd = dup(domainless_session_fd);
+    if (fd == -1) {
+      domainless_unlock();
+      return -1;
+    }
+    return fd;
+  }
+
   struct sockaddr_un addr = {
     .sun_family = AF_UNIX,
     .sun_path = { 0 }
@@ -53,12 +132,59 @@ static int rezygiskd_connect(uint8_t retry) {
   return -1;
 }
 
+bool rezygiskd_init_domainless_session() {
+  if (access(DOMAINLESS_MARKER, F_OK) == -1) return true;
+  if (domainless_session_fd >= 0) return true;
+
+  struct domainless_channel *channel = mmap(NULL, sizeof(*channel), PROT_READ | PROT_WRITE,
+                                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (channel == MAP_FAILED) {
+    PLOGE("mmap domainless channel");
+    return false;
+  }
+
+  int fd = rezygiskd_connect(5);
+  if (fd == -1) {
+    munmap(channel, sizeof(*channel));
+    return false;
+  }
+  if (write_uint8_t(fd, (uint8_t)DomainlessSession) == -1) {
+    close(fd);
+    munmap(channel, sizeof(*channel));
+    return false;
+  }
+
+  uint8_t accepted = 0;
+  if (read_uint8_t(fd, &accepted) == -1 || accepted != 1) {
+    close(fd);
+    munmap(channel, sizeof(*channel));
+    return false;
+  }
+
+  domainless_channel = channel;
+  domainless_session_fd = fd;
+  LOGI("APatch domainless daemon session established");
+  return true;
+}
+
+void rezygiskd_release_domainless_session_in_child() {
+  if (domainless_session_fd < 0) return;
+
+  close(domainless_session_fd);
+  domainless_session_fd = -1;
+  domainless_session_released = true;
+  if (domainless_channel != NULL) {
+    munmap(domainless_channel, sizeof(*domainless_channel));
+    domainless_channel = NULL;
+  }
+}
+
 /* TODO: We should unify all of those */
 #define safe_write(fn, name, ret_type)             \
   if (fn == -1) {                                  \
     LOGE("Failed to write " name " to ReZygiskd"); \
                                                    \
-    close(fd);                                     \
+    rezygiskd_disconnect(fd);                      \
                                                    \
     ret_type;                                      \
   }
@@ -67,7 +193,7 @@ static int rezygiskd_connect(uint8_t retry) {
   if (fn == -1) {                                   \
     LOGE("Failed to read " name " from ReZygiskd"); \
                                                     \
-    close(fd);                                      \
+    rezygiskd_disconnect(fd);                       \
                                                     \
     ret_type;                                       \
   }
@@ -78,7 +204,7 @@ bool rezygiskd_zygote_injected() {
 
   safe_write(write_uint8_t(fd, (uint8_t)ZygoteInjected), "ZygoteInjected action", return false);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return true;
 }
@@ -94,7 +220,7 @@ uint32_t rezygiskd_get_process_flags(uid_t uid, const char *const process) {
   uint32_t res = 0;
   safe_read(read_uint32_t(fd, &res), "process flags", return 0);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return res;
 }
@@ -125,7 +251,7 @@ void rezygiskd_get_info(struct rezygisk_info *info) {
   if (info->modules.modules_count == 0) {
     info->modules.modules = NULL;
 
-    close(fd);
+    rezygiskd_disconnect(fd);
 
     return;
   }
@@ -136,7 +262,7 @@ void rezygiskd_get_info(struct rezygisk_info *info) {
 
     info->modules.modules_count = 0;
 
-    close(fd);
+    rezygiskd_disconnect(fd);
 
     return;
   }
@@ -207,7 +333,7 @@ void rezygiskd_get_info(struct rezygisk_info *info) {
       break;
   }
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 }
 
 void free_rezygisk_info(struct rezygisk_info *info) {
@@ -233,7 +359,7 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
   if (!modules->modules) {
     PLOGE("allocating modules name memory");
 
-    close(fd);
+    rezygiskd_disconnect(fd);
 
     return false;
   }
@@ -247,7 +373,7 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
       modules->modules_count = i;
       free_modules(modules);
 
-      close(fd);
+      rezygiskd_disconnect(fd);
 
       return false;
     }
@@ -255,7 +381,7 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
     modules->modules[i] = lib_path;
   }
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return true;
 }
@@ -277,12 +403,17 @@ int rezygiskd_connect_companion(size_t index) {
   safe_write(write_uint8_t(fd, (uint8_t)RequestCompanionSocket), "RequestCompanionSocket action", return -1);
   safe_write(write_size_t(fd, index), "companion index", return -1);
 
+  if (domainless_session_fd >= 0) {
+    int companion_fd = read_fd(fd);
+    rezygiskd_disconnect(fd);
+    return companion_fd;
+  }
+
   uint8_t res = 0;
   safe_read(read_uint8_t(fd, &res), "companion socket result", return -1);
-
   if (res == 1) return fd;
   else {
-    close(fd);
+    rezygiskd_disconnect(fd);
 
     return -1;
   }
@@ -297,7 +428,7 @@ int rezygiskd_get_module_dir(size_t index) {
 
   int dirfd = read_fd(fd);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return dirfd;
 }
@@ -308,7 +439,7 @@ void rezygiskd_zygote_restart() {
 
   safe_write(write_uint8_t(fd, (uint8_t)ZygoteRestart), "ZygoteRestart action", return);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 }
 
 bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_t buf_size) {
@@ -328,14 +459,14 @@ bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_
   if (target_fd == 0) {
     LOGE("Failed to get target fd");
 
-    close(fd);
+    rezygiskd_disconnect(fd);
 
     return false;
   }
 
   snprintf(buf, buf_size, "/proc/%u/fd/%u", target_pid, target_fd);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return true;
 }
@@ -350,7 +481,7 @@ bool rezygiskd_remove_module(size_t index) {
   uint8_t res = 0;
   safe_read(read_uint8_t(fd, &res), "remove module result", return false);
 
-  close(fd);
+  rezygiskd_disconnect(fd);
 
   return res == 1;
 }

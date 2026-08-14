@@ -1149,6 +1149,10 @@ static void rz_app_specialize_pre(struct zygisk_context *ctx) {
 static void rz_app_specialize_post(struct zygisk_context *ctx) {
   rz_run_modules_post(ctx);
 
+  /* Domainless children may use the inherited control channel only while
+     trusted Zygisk callbacks are executing. Do not expose it to app code. */
+  rezygiskd_release_domainless_session_in_child();
+
   /* INFO: Allow the process name string to be released */
   (*ctx->env)->ReleaseStringUTFChars(ctx->env, *ctx->args.app->nice_name, ctx->process);
   g_ctx = NULL;
@@ -1184,6 +1188,7 @@ static void rz_nativeForkSystemServer_post(struct zygisk_context *ctx) {
     LOGV("post forkSystemServer");
 
     rz_run_modules_post(ctx);
+    rezygiskd_release_domainless_session_in_child();
   }
 
   rz_fork_post(ctx);

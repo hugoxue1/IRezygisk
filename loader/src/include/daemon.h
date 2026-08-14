@@ -14,7 +14,8 @@ enum rezygiskd_actions {
   GetModuleDir,
   ZygoteRestart,
   UpdateMountNamespace,
-  RemoveModule
+  RemoveModule,
+  DomainlessSession
 };
 
 struct zygisk_modules {
@@ -48,6 +49,10 @@ static inline const char *rezygiskd_get_path() {
 }
 
 bool rezygiskd_zygote_injected();
+
+bool rezygiskd_init_domainless_session();
+
+void rezygiskd_release_domainless_session_in_child();
 
 uint32_t rezygiskd_get_process_flags(uid_t uid, const char *const process);
 

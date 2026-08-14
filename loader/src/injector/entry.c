@@ -22,7 +22,7 @@ void entry(void *addr, size_t size, int tango_flag) {
     perform_ptrace_message_clear();
   }
 
-  if (!rezygiskd_zygote_injected()) {
+  if (!rezygiskd_init_domainless_session() || !rezygiskd_zygote_injected()) {
     LOGE("ReZygiskd is not running");
 
     return;

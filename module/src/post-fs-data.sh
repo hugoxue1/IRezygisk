@@ -3,6 +3,12 @@
 set -e
 
 MODDIR=${0%/*}
+if [ -f "$MODDIR/.apatch-domainless-v1" ]; then
+  # APatch already started the monitor through early-loader-v1 before this
+  # ordinary module stage. Starting the legacy PID-1 tracer here would race it.
+  exit 0
+fi
+
 if [ "$ZYGISK_ENABLED" ]; then
   exit 0
 fi

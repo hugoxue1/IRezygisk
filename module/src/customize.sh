@@ -6,6 +6,8 @@ MIN_KSU_VERSION=@MIN_KSU_VERSION@
 MIN_KSUD_VERSION=@MIN_KSUD_VERSION@
 MIN_MAGISK_VERSION=@MIN_MAGISK_VERSION@
 MIN_APATCH_VERSION=@MIN_APATCH_VERSION@
+MIN_APATCH_DOMAINLESS_VERSION=@MIN_APATCH_DOMAINLESS_VERSION@
+APATCH_DOMAINLESS=false
 
 if [ "$BOOTMODE" ] && [ "$KSU" ]; then
   ui_print "- Installing from KernelSU app"
@@ -35,6 +37,12 @@ if [ "$BOOTMODE" ] && [ "$KSU" ]; then
       ui_print "! APatch version is too old!"
       ui_print "! Please update APatch to latest version"
       abort    "*********************************************************"
+    fi
+    if [ "$APATCH_VER_CODE" -ge "$MIN_APATCH_DOMAINLESS_VERSION" ]; then
+      APATCH_DOMAINLESS=true
+      ui_print "- APatch domainless-v1 backend enabled"
+    else
+      ui_print "- APatch legacy backend enabled"
     fi
 elif [ "$BOOTMODE" ] && [ "$MAGISK_VER_CODE" ]; then
   ui_print "- Installing from Magisk app"
@@ -97,6 +105,12 @@ extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
+if [ "$APATCH_DOMAINLESS" = true ]; then
+  extract "$ZIPFILE" 'apatch-early-loader.json' "$MODPATH"
+  touch "$MODPATH/.apatch-domainless-v1"
+else
+  rm -f "$MODPATH/apatch-early-loader.json" "$MODPATH/.apatch-domainless-v1"
+fi
 extract "$ZIPFILE" 'rezygisk.sh' "/data/adb/post-fs-data.d/"
 
 # INFO: KernelSU 2.x.x and below runs post-fs-data.d before mounting
@@ -115,7 +129,13 @@ cp "$MODPATH/module.prop" "$MODPATH/module.prop.bak"
 
 chmod +x "$MODPATH/uninstall.sh"
 
-mv "$TMPDIR/sepolicy.rule" "$MODPATH"
+if [ "$APATCH_DOMAINLESS" = true ]; then
+  # Domainless mode must not leave a live module policy behind. APatch validates
+  # this invariant before it starts the early loader.
+  rm -f "$MODPATH/sepolicy.rule" "$TMPDIR/sepolicy.rule"
+else
+  mv "$TMPDIR/sepolicy.rule" "$MODPATH"
+fi
 
 mkdir "$MODPATH/bin"
 mkdir "$MODPATH/webroot"
@@ -199,6 +219,18 @@ else
     mv "$MODPATH/bin/libzygisk_ptrace.so" "$MODPATH/bin/zygisk-ptrace64"
 
     extract "$ZIPFILE" 'machikado.arm64' "$MODPATH" true
+  fi
+fi
+
+if [ "$APATCH_DOMAINLESS" = true ]; then
+  # The package carries both declarations, but some devices expose only one
+  # app_process ABI. Keep the installed manifest consistent with the binaries
+  # actually extracted on this device so APatch can validate it fail-closed.
+  if [ "$SUPPORTS_32BIT" != true ]; then
+    sed -i '/"entry32"/d' "$MODPATH/apatch-early-loader.json"
+  fi
+  if [ "$SUPPORTS_64BIT" != true ]; then
+    sed -i '/"entry64"/d' "$MODPATH/apatch-early-loader.json"
   fi
 fi
 

@@ -12,6 +12,20 @@ int main(int argc, char **argv) {
     init_monitor();
 
     return 0;
+  } else if (argc >= 2 && strcmp(argv[1], "monitor-domainless") == 0) {
+    init_domainless_monitor();
+
+    return 0;
+  } else if (argc >= 3 && strcmp(argv[1], "trace-direct") == 0) {
+    bool is_tango = false;
+    for (int i = 3; i < argc; i++) {
+      if (strcmp(argv[i], "--tango") == 0) is_tango = true;
+    }
+
+    long pid = strtol(argv[2], 0, 0);
+    /* Domainless mode is deliberately fail-open for boot safety: a missed
+       injection window must never kill or restart the real Zygote. */
+    return trace_zygote_direct(pid, is_tango) ? 0 : 1;
   } else if (argc >= 3 && strcmp(argv[1], "trace") == 0) {
       bool is_tango = false;
       bool do_restart = false;
@@ -106,7 +120,9 @@ int main(int argc, char **argv) {
     printf(
       "Available commands:\n"
       " - monitor\n"
+      " - monitor-domainless\n"
       " - trace <pid> [--restart]\n"
+      " - trace-direct <pid>\n"
       " - ctl <start|stop|exit>\n"
       " - version: Shows the version of ReZygisk.\n"
       " - info: Shows information about the created daemon/injection.\n"

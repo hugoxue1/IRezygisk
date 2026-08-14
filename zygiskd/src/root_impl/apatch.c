@@ -88,7 +88,15 @@ bool _apatch_get_package_config(struct packages_config *restrict config) {
   char line[1024];
   /* INFO: Skip the CSV header */
   if (fgets(line, sizeof(line), fp) == NULL) {
-    LOGE("Failed to read APatch's package_config header: %s", strerror(errno));
+    if (feof(fp)) {
+      /* APatch intentionally keeps this file empty when there are no package
+         rules. Treat it as a valid empty configuration, not an I/O error. */
+      fclose(fp);
+
+      return true;
+    }
+
+    LOGE("Failed to read APatch's package_config header: %s", ferror(fp) ? strerror(errno) : "unknown read error");
 
     fclose(fp);
 

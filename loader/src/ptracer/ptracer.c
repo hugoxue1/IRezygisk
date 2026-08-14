@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <errno.h>
 
 #include <link.h>
 #include <signal.h>
@@ -239,4 +240,82 @@ bool trace_zygote(int pid, bool tango_flag) {
   }
 
   return true;
+}
+
+bool trace_zygote_direct(int pid, bool tango_flag) {
+  LOGI("start direct tracing %d (tracer %d)", pid, getpid());
+
+  int status = 0;
+  bool attached = false;
+  bool injected = false;
+  uintptr_t libc_init_got_slot = 0;
+  uintptr_t libc_init_resolved = 0;
+
+  /* Do not use PTRACE_O_EXITKILL here. Domainless mode must leave the booting
+     Zygote alive even if the tracer itself crashes or APatch rejects it. */
+  if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_TRACESECCOMP) == -1) {
+    PLOGE("direct seize");
+
+    return false;
+  }
+  attached = true;
+
+  if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) == -1) {
+    PLOGE("direct interrupt");
+
+    goto cleanup;
+  }
+
+  wait_for_trace(pid, &status, __WALL);
+  if (!STOPPED_WITH(SIGTRAP, PTRACE_EVENT_STOP)) {
+    char status_str[64];
+    parse_status(status, status_str, sizeof(status_str));
+    LOGE("direct attach expected ptrace event-stop, got: %s", status_str);
+
+    goto cleanup;
+  }
+
+  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+    PLOGE("direct initial syscall step");
+
+    goto cleanup;
+  }
+
+  if (!wait_for_ptrace_syscall_stop(pid, &status)) goto cleanup;
+
+  if (!wait_linker_ready(pid, &libc_init_resolved, &libc_init_got_slot)) {
+    LOGE("direct mode missed or failed the linker injection window");
+
+    goto cleanup;
+  }
+
+  LOGD("direct mode resolved __libc_init at %p (GOT slot %p)",
+       (void *)libc_init_resolved, (void *)libc_init_got_slot);
+
+  {
+    char *lib_path = "/data/adb/modules/rezygisk/lib" LP_SELECT("", "64") "/libzygisk.so";
+    if (!inject_on_main(pid, lib_path, libc_init_resolved, libc_init_got_slot, tango_flag)) {
+      LOGE("direct mode failed to inject");
+
+      /* inject_on_main normally restores this slot. Repeat the restoration on
+         every failure path so an aborted experiment cannot poison Zygote. */
+      if (libc_init_got_slot != 0 && libc_init_resolved != 0) {
+        ptrace_poke_uintptr(pid, libc_init_got_slot, libc_init_resolved);
+      }
+
+      goto cleanup;
+    }
+  }
+
+  injected = true;
+
+cleanup:
+  if (attached && ptrace(PTRACE_DETACH, pid, 0, 0) == -1 && errno != ESRCH) {
+    PLOGE("direct detach");
+  }
+
+  if (injected) LOGI("direct injection completed for %d", pid);
+  else LOGW("direct injection safely abandoned for %d", pid);
+
+  return injected;
 }

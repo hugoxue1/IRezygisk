@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include <inttypes.h>
 #include <linux/limits.h>
@@ -704,14 +705,41 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
     *out_libc_init_got_slot = ((uintptr_t)m->start - bias) + got_off;
   }
 
-  free_maps(remote_map);
+  if (*out_libc_init_got_slot == 0) {
+    LOGE("Failed to locate __libc_init GOT slot for pid %d", pid);
+    free_maps(remote_map);
+
+    return false;
+  }
 
   uintptr_t initial_value = 0;
   if (read_proc(pid, *out_libc_init_got_slot, &initial_value, sizeof(initial_value)) != sizeof(initial_value)) {
     LOGE("Failed to read initial value of __libc_init GOT slot at 0x%" PRIxPTR, *out_libc_init_got_slot);
 
+    free_maps(remote_map);
+
     return false;
   }
+
+  /* A direct attach may observe an already-running Zygote. If the GOT slot
+     already points into libc, __libc_init has run and there is no safe early
+     injection window left. Never wait for an impossible second resolution. */
+  uintptr_t normalized_initial = initial_value & ~(uintptr_t)1;
+  for (size_t i = 0; i < remote_map->length; i++) {
+    const struct map_entry *m = &remote_map->maps[i];
+    if (!m->path || !strstr(m->path, "/libc.so")) continue;
+    if (normalized_initial >= (uintptr_t)m->start && normalized_initial < (uintptr_t)m->end) {
+      LOGW("__libc_init GOT is already resolved for pid %d; safe late-attach rejection", pid);
+      free_maps(remote_map);
+
+      return false;
+    }
+  }
+  free_maps(remote_map);
+
+  struct timespec started = {};
+  clock_gettime(CLOCK_MONOTONIC, &started);
+  int syscall_steps = 0;
 
   /* INFO: Loop till linker changes the value (resolves the symbol) */
   while (1) {
@@ -729,6 +757,16 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
       LOGI("Resolved __libc_init (0x%" PRIxPTR " -> 0x%" PRIxPTR ", pid %d)", initial_value, current_value, pid);
 
       return true;
+    }
+
+    struct timespec now = {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L +
+                      (now.tv_nsec - started.tv_nsec) / 1000000L;
+    if (elapsed_ms > 2000L || syscall_steps++ >= 512) {
+      LOGE("Timed out waiting for __libc_init resolution for pid %d", pid);
+
+      return false;
     }
 
     /* INFO: Step to the next syscall */

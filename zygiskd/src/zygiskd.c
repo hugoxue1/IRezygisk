@@ -320,6 +320,8 @@ void zygiskd_start(char *restrict argv[]) {
 
   bool first_process = true;
   while (1) {
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
     int client_fd = accept(socket_fd, NULL, NULL);
     if (client_fd == -1) {
       LOGE("accept: %s", strerror(errno));
@@ -327,6 +329,10 @@ void zygiskd_start(char *restrict argv[]) {
       break;
     }
 
+    bool persistent_client = false;
+
+    read_client_action:
+    ;
     uint8_t action8 = 0;
     ssize_t len = read_uint8_t(client_fd, &action8);
     if (len == -1) {
@@ -344,6 +350,32 @@ void zygiskd_start(char *restrict argv[]) {
     }
 
     enum DaemonSocketAction action = (enum DaemonSocketAction)action8;
+
+    if (action == DomainlessSession) {
+      if (persistent_client) {
+        LOGE("duplicate domainless session request");
+        break;
+      }
+
+      pid_t handler = fork();
+      if (handler == -1) {
+        LOGE("fork domainless session handler: %s", strerror(errno));
+        write_uint8_t(client_fd, 0);
+        close(client_fd);
+        continue;
+      }
+      if (handler > 0) {
+        close(client_fd);
+        continue;
+      }
+
+      /* A private child services the inherited Zygote channel while the main
+         daemon remains available for status and a future Zygote restart. */
+      close(socket_fd);
+      persistent_client = true;
+      if (write_uint8_t(client_fd, 1) == -1) break;
+      goto read_client_action;
+    }
 
     switch (action) {
       case ZygoteInjected: {
@@ -524,7 +556,21 @@ void zygiskd_start(char *restrict argv[]) {
                  so just sending the file descriptor of the client is
                  safe.
         */
-        if (module->companion >= 0) {
+        if (module->companion >= 0 && persistent_client) {
+          int pair[2];
+          if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == -1) {
+            LOGE("create domainless companion pair: %s", strerror(errno));
+            write_uint8_t(client_fd, 0);
+            break;
+          }
+
+          if (write_fd(module->companion, pair[0]) == -1 || write_fd(client_fd, pair[1]) == -1) {
+            LOGE("send domainless companion pair for module \"%s\"", module->name);
+            write_uint8_t(client_fd, 0);
+          }
+          close(pair[0]);
+          close(pair[1]);
+        } else if (module->companion >= 0) {
           LOGI(" - Sending companion fd socket of module \"%s\"", module->name);
 
           if (write_fd(module->companion, client_fd) == -1) {
@@ -646,8 +692,10 @@ void zygiskd_start(char *restrict argv[]) {
 
         break;
       }
+      case DomainlessSession: { break; }
     }
 
+    if (persistent_client) goto read_client_action;
     close(client_fd);
   }
 

@@ -71,7 +71,8 @@ $(MODULE_DONE): $(LOADER_DONE) $(ZYGISKD_DONE) $(MODULE_INPUTS)
 
 
 	@echo "Copying module files..."
-	@cp module/src/verify.sh module/src/sepolicy.rule module/src/rezygisk.sh $(MODULE_OUT)/
+	@cp module/src/verify.sh module/src/sepolicy.rule module/src/rezygisk.sh \
+	   module/src/apatch-early-loader.json $(MODULE_OUT)/
 
 	@echo "Customizing module.prop..."
 	@sed -e 's/$${moduleId}/$(MODULE_ID)/g'                                             \
@@ -84,6 +85,7 @@ $(MODULE_DONE): $(LOADER_DONE) $(ZYGISKD_DONE) $(MODULE_INPUTS)
 	@for script in customize.sh post-fs-data.sh service.sh uninstall.sh; do \
 		sed -e 's/@DEBUG@/$(if $(filter debug,$(BUILD_TYPE)),true,false)/g' \
 		    -e 's/@MIN_APATCH_VERSION@/$(MIN_APATCH_VERSION)/g'             \
+		    -e 's/@MIN_APATCH_DOMAINLESS_VERSION@/$(MIN_APATCH_DOMAINLESS_VERSION)/g' \
 		    -e 's/@MIN_KSU_VERSION@/$(MIN_KSU_VERSION)/g'                   \
 		    -e 's/@MIN_KSUD_VERSION@/$(MIN_KSUD_VERSION)/g'                 \
 		    -e 's/@MIN_MAGISK_VERSION@/$(MIN_MAGISK_VERSION)/g'             \

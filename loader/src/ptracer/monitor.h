@@ -4,8 +4,10 @@
 #include <stdbool.h>
 
 void init_monitor();
+void init_domainless_monitor();
 
 bool trace_zygote(int pid, bool is_tango);
+bool trace_zygote_direct(int pid, bool is_tango);
 
 enum rezygiskd_command {
   START = 1,

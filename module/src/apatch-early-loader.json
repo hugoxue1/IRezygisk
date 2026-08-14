@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "mode": "domainless-v1",
+  "entry64": "bin/zygisk-ptrace64",
+  "entry32": "bin/zygisk-ptrace32",
+  "arguments": ["monitor-domainless"]
+}

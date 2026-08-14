@@ -2,11 +2,17 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 
@@ -41,6 +47,7 @@ enum ptracer_tracing_state {
 };
 
 enum ptracer_tracing_state tracing_state = TRACING;
+static bool domainless_monitor_active = false;
 
 struct rezygiskd_status {
   bool supported;
@@ -179,9 +186,9 @@ void rezygiskd_listener_callback() {
 
           tracing_state = TRACING;
         } else if (tracing_state == STOPPED) {
-          LOGI("Start tracing init");
+          LOGI(domainless_monitor_active ? "Start direct Zygote discovery" : "Start tracing init");
 
-          ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK);
+          if (!domainless_monitor_active) ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK);
 
           tracing_state = TRACING;
         }
@@ -194,10 +201,10 @@ void rezygiskd_listener_callback() {
         if (tracing_state == TRACING) {
           LOGI("Stop tracing requested");
 
-          tracing_state = STOPPING;
+          tracing_state = domainless_monitor_active ? STOPPED : STOPPING;
           monitor_stop_reason = "user requested";
 
-          ptrace(PTRACE_INTERRUPT, 1, 0, 0);
+          if (!domainless_monitor_active) ptrace(PTRACE_INTERRUPT, 1, 0, 0);
           update_status(NULL);
         }
 
@@ -965,6 +972,331 @@ static bool prepare_environment() {
   fclose(orig_prop);
 
   return true;
+}
+
+#define DOMAINLESS_BROKER_FD_ENV "APATCH_EARLY_LOADER_FD"
+#define DOMAINLESS_MAX_TARGETS 64
+
+static pid_t domainless_targets[DOMAINLESS_MAX_TARGETS];
+static bool domainless_target_is64[DOMAINLESS_MAX_TARGETS];
+static bool domainless_expect64 = false;
+static bool domainless_expect32 = false;
+
+static bool domainless_read_line(int fd, char *buf, size_t size) {
+  if (size == 0) return false;
+
+  size_t used = 0;
+  while (used + 1 < size) {
+    char c;
+    ssize_t nread = read(fd, &c, 1);
+    if (nread == -1 && errno == EINTR) continue;
+    if (nread != 1) return false;
+    if (c == '\n') break;
+
+    buf[used++] = c;
+  }
+
+  buf[used] = '\0';
+  return true;
+}
+
+static int domainless_open_broker() {
+  const char *raw_fd = getenv(DOMAINLESS_BROKER_FD_ENV);
+  if (raw_fd == NULL || *raw_fd == '\0') {
+    LOGE("%s is missing", DOMAINLESS_BROKER_FD_ENV);
+
+    return -1;
+  }
+
+  char *end = NULL;
+  errno = 0;
+  long parsed = strtol(raw_fd, &end, 10);
+  if (errno != 0 || end == raw_fd || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
+    LOGE("invalid %s value", DOMAINLESS_BROKER_FD_ENV);
+
+    return -1;
+  }
+
+  int fd = (int)parsed;
+  if (dprintf(fd, "READY 1\n") < 0) {
+    PLOGE("send READY to APatch early-loader broker");
+
+    return -1;
+  }
+
+  char response[128];
+  if (!domainless_read_line(fd, response, sizeof(response)) || strcmp(response, "OK READY") != 0) {
+    LOGE("APatch early-loader broker rejected READY");
+
+    return -1;
+  }
+
+  /* The monitor keeps this descriptor, but its tracer and daemon exec children
+     must not inherit it and accidentally keep the APD broker alive. */
+  int flags = fcntl(fd, F_GETFD);
+  if (flags != -1) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+
+  return fd;
+}
+
+static bool domainless_authorize_target(int broker_fd, pid_t pid, bool is_64bit) {
+  if (dprintf(broker_fd, "AUTHORIZE_ZYGOTE %d %d\n", pid, is_64bit ? 64 : 32) < 0) {
+    PLOGE("request Zygote authorization");
+
+    return false;
+  }
+
+  char response[128];
+  if (!domainless_read_line(broker_fd, response, sizeof(response))) {
+    LOGE("APatch early-loader broker disconnected");
+
+    return false;
+  }
+
+  char expected[64];
+  snprintf(expected, sizeof(expected), "AUTHORIZED %d", pid);
+  if (strcmp(response, expected) != 0) {
+    LOGW("APatch denied Zygote %d authorization: %s", pid, response);
+
+    return false;
+  }
+
+  return true;
+}
+
+static bool domainless_read_identity(pid_t pid, uid_t *uid, pid_t *ppid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/status", pid);
+
+  FILE *status_file = fopen(path, "re");
+  if (status_file == NULL) return false;
+
+  bool found_uid = false;
+  bool found_ppid = false;
+  char line[256];
+  while (fgets(line, sizeof(line), status_file) != NULL) {
+    unsigned parsed;
+    if (!found_uid && sscanf(line, "Uid:\t%u", &parsed) == 1) {
+      *uid = (uid_t)parsed;
+      found_uid = true;
+    } else if (!found_ppid && sscanf(line, "PPid:\t%u", &parsed) == 1) {
+      *ppid = (pid_t)parsed;
+      found_ppid = true;
+    }
+
+    if (found_uid && found_ppid) break;
+  }
+
+  fclose(status_file);
+  return found_uid && found_ppid;
+}
+
+static bool domainless_target_seen(pid_t pid) {
+  for (size_t i = 0; i < DOMAINLESS_MAX_TARGETS; i++) {
+    if (domainless_targets[i] == pid) return true;
+  }
+
+  return false;
+}
+
+static bool domainless_remember_target(pid_t pid, bool is_64bit) {
+  for (size_t i = 0; i < DOMAINLESS_MAX_TARGETS; i++) {
+    if (domainless_targets[i] != 0) continue;
+
+    domainless_targets[i] = pid;
+    domainless_target_is64[i] = is_64bit;
+    return true;
+  }
+
+  LOGE("domainless target table is full");
+  return false;
+}
+
+static void domainless_forget_dead_targets() {
+  bool changed = false;
+  for (size_t i = 0; i < DOMAINLESS_MAX_TARGETS; i++) {
+    if (domainless_targets[i] == 0) continue;
+    if (kill(domainless_targets[i], 0) == -1 && errno == ESRCH) {
+      struct rezygiskd_status *status = domainless_target_is64[i] ? &status64 : &status32;
+      status->zygote_injected = false;
+      domainless_targets[i] = 0;
+      domainless_target_is64[i] = false;
+      changed = true;
+    }
+  }
+  if (changed) update_status("Zygote restarted; waiting for domainless reinjection");
+}
+
+static void domainless_launch_tracer(int broker_fd, pid_t pid, bool is_64bit) {
+  const char *tracer = is_64bit ? "./bin/zygisk-ptrace64" : "./bin/zygisk-ptrace32";
+  int child = fork_dont_care();
+
+  if (child == 0) {
+    close(broker_fd);
+
+    /* Avoid an extra exec on the native-ABI Zygote. This is the common 64-bit
+       path and materially shortens the narrow post-exec injection window. */
+    if ((sizeof(void *) == 8) == is_64bit) {
+      _exit(trace_zygote_direct(pid, false) ? 0 : 1);
+    }
+
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+
+    execl(tracer, basename(tracer), "trace-direct", pid_str, NULL);
+    PLOGE("exec direct tracer");
+    _exit(1);
+  } else if (child == -1) {
+    LOGE("failed to fork direct tracer for %d", pid);
+  }
+}
+
+static void domainless_consider_target(int broker_fd, pid_t pid, const char *program) {
+  bool is_64bit;
+  if (strcmp(program, APP_PROCESS_64) == 0) is_64bit = true;
+  else if (strcmp(program, APP_PROCESS_32) == 0) is_64bit = false;
+  else return;
+
+  if (domainless_target_seen(pid)) return;
+
+  uid_t uid = (uid_t)-1;
+  pid_t ppid = -1;
+  if (!domainless_read_identity(pid, &uid, &ppid) || uid != 0 || ppid != 1) return;
+
+  /* Record before any blocking IPC so the same live process cannot be raced by
+     two scan iterations. A restarted Zygote gets a new PID and is considered. */
+  if (!domainless_remember_target(pid, is_64bit)) return;
+
+  if ((is_64bit && should_stop_inject64()) || (!is_64bit && should_stop_inject32())) {
+    LOGE("Zygote%s restarted too often; domainless injection is suspended", is_64bit ? "64" : "32");
+    monitor_stop_reason = "Zygote restarted too often";
+    tracing_state = STOPPED;
+    update_status(NULL);
+
+    return;
+  }
+
+  if (!ensure_daemon_created(is_64bit)) {
+    LOGE("ReZygiskd%s could not start; leaving Zygote %d untouched", is_64bit ? "64" : "32", pid);
+
+    return;
+  }
+
+  if (!domainless_authorize_target(broker_fd, pid, is_64bit)) return;
+
+  LOGI("APatch authorized direct Zygote%s target %d", is_64bit ? "64" : "32", pid);
+  domainless_launch_tracer(broker_fd, pid, is_64bit);
+}
+
+static void domainless_scan_proc(int broker_fd) {
+  DIR *proc = opendir("/proc");
+  if (proc == NULL) {
+    PLOGE("open /proc");
+
+    return;
+  }
+
+  struct dirent *entry;
+  while ((entry = readdir(proc)) != NULL) {
+    if (!isdigit((unsigned char)entry->d_name[0])) continue;
+
+    char *end = NULL;
+    long parsed = strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0' || parsed <= 1 || parsed > INT_MAX) continue;
+
+    pid_t pid = (pid_t)parsed;
+    if (domainless_target_seen(pid)) continue;
+
+    char program[PATH_MAX];
+    if (get_program(pid, program, sizeof(program)) == -1) continue;
+
+    domainless_consider_target(broker_fd, pid, program);
+  }
+
+  closedir(proc);
+}
+
+static bool domainless_prepare_runtime() {
+  const char *runtime = "/data/adb/rezygisk";
+  if (mkdir(runtime, 0555) == -1 && errno != EEXIST) {
+    PLOGE("create domainless runtime");
+
+    return false;
+  }
+  chmod(runtime, 0555);
+
+  /* These are transient sockets/state from the previous boot. Module data and
+     user configuration are deliberately not removed here. */
+  unlink("/data/adb/rezygisk/init_monitor");
+  unlink("/data/adb/rezygisk/cp32.sock");
+  unlink("/data/adb/rezygisk/cp64.sock");
+  unlink("/data/adb/rezygisk/state.json");
+
+  return true;
+}
+
+void init_domainless_monitor() {
+  LOGI("IRezygisk %s (APatch domainless-v1)", ZKSU_VERSION);
+  domainless_monitor_active = true;
+  memset(domainless_targets, 0, sizeof(domainless_targets));
+  memset(domainless_target_is64, 0, sizeof(domainless_target_is64));
+
+  char zygote_mode[PROP_VALUE_MAX] = { 0 };
+  __system_property_get("ro.zygote", zygote_mode);
+  if (zygote_mode[0] != '\0') {
+    domainless_expect64 = strstr(zygote_mode, "64") != NULL;
+    domainless_expect32 = strstr(zygote_mode, "32") != NULL;
+  } else {
+    domainless_expect64 = access(APP_PROCESS_64, X_OK) == 0;
+    domainless_expect32 = access(APP_PROCESS_32, X_OK) == 0;
+  }
+
+  if (!domainless_prepare_runtime() || !prepare_environment()) exit(1);
+  if (!rezygiskd_listener_init()) exit(1);
+  if (!sigchld_listener_init()) {
+    rezygiskd_listener_stop();
+    exit(1);
+  }
+
+  /* Start the native-ABI daemon while init is still held by APatch. Waiting
+     until app_process appears would spend the most valuable part of the
+     injection window on a daemon fork/exec. */
+  if (!ensure_daemon_created(sizeof(void *) == 8)) {
+    sigchld_listener_stop();
+    rezygiskd_listener_stop();
+    exit(1);
+  }
+
+  int broker_fd = domainless_open_broker();
+  if (broker_fd == -1) {
+    sigchld_listener_stop();
+    rezygiskd_listener_stop();
+    exit(1);
+  }
+
+  update_status(NULL);
+  LOGI("domainless monitor armed; PID 1 is not traced");
+
+  while (monitor_events_running) {
+    /* The listener is nonblocking, so this handles status/control datagrams
+       without a second thread while /proc discovery owns the main loop. */
+    rezygiskd_listener_callback();
+    sigchld_listener_callback();
+
+    if (tracing_state == TRACING) domainless_scan_proc(broker_fd);
+    domainless_forget_dead_targets();
+
+    bool injected_all_supported =
+      (!domainless_expect64 || status64.zygote_injected) &&
+      (!domainless_expect32 || status32.zygote_injected) &&
+      (domainless_expect64 || domainless_expect32);
+    usleep(injected_all_supported ? 100000 : 500);
+  }
+
+  close(broker_fd);
+  sigchld_listener_stop();
+  rezygiskd_listener_stop();
+  LOGI("Terminating APatch domainless monitor");
 }
 
 void init_monitor() {
