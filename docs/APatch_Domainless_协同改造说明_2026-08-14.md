@@ -251,7 +251,10 @@ zygisk-ptrace64: process -1 received unknown sigchld_status ...
 `ro.zygote` 预置 ABI 展示。修复不修改 APatch/KernelPatch ABI、不增加 live-policy，也不触碰设备；用户
 安装新 ZIP 后仍须重启并以进程、state.json、32/64 maps 和实际模块功能联合验收。
 
-构建状态：`i1` 已在 Android API 25 目标上完整清理构建通过 arm64-v8a、armeabi-v7a、x86、x86_64，
-但首次真机失败；`i2` 修复后必须重新完成同一四 ABI 构建。代码编译通过不等于真机通过。APatch 19067 +
-IRezygisk 的单模块 32/64 注入、ckbsmart、Assistant、Hunter 和三次冷启动门禁仍待验证，在此之前不得
-标为稳定版。
+构建状态：`i1` 虽在 Android API 25 目标上通过四 ABI 构建，但首次真机失败。`i2` 源码提交
+`eea79b957282f6a97b19f8e23f62cb009be6599b` 已重新 clean Release 通过 arm64-v8a、armeabi-v7a、x86、
+x86_64，产物为 `IRezygisk-v1.0.0-i2-539-eea79b9-release.zip`，SHA-256 为
+`EE211615F298B2B99826A355C2E572B88EAE7C69C83CB365EBACB4C6549DA0CD`。四种 ELF class/machine 与目录
+一致，ZIP 内 99 个 payload hash 全部复算通过；`misaki.sig` 为空，表示该测试包未配置模块私钥，安装时
+仍由 `verify.sh` 执行逐文件 SHA-256。代码编译通过不等于真机通过。APatch 19067 + IRezygisk 的单模块
+32/64 注入、ckbsmart、Assistant、Hunter 和三次冷启动门禁仍待验证，在此之前不得标为稳定版。

@@ -10,8 +10,8 @@
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
 当前定制代号为 `v1.0.0-i2`，配套最低版本 APatch 19067。`i1` 首次真机启动暴露了 early-loader
-环境契约和 `SIGCHLD` 排空问题；`i2` 已完成源码修复，四 ABI Release 与真机复验状态以协同改造说明
-末尾为准。完成分层真机回归前，它仍是测试候选，不是稳定发布。
+环境契约和 `SIGCHLD` 排空问题；`i2` 已完成源码修复和四 ABI clean Release，真机复验状态以协同改造
+说明末尾为准。完成分层真机回归前，它仍是测试候选，不是稳定发布。
 
 仓库角色：
 
