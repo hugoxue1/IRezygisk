@@ -32,6 +32,7 @@ struct Context {
 #define PATH_CP_NAME TMP_PATH "/" LP_SELECT("cp32.sock", "cp64.sock")
 #define ZYGISKD_FILE PATH_MODULES_DIR "/rezygisk/bin/zygiskd" LP_SELECT("32", "64")
 #define ZYGISKD_PATH "/data/adb/modules/rezygisk/bin/zygiskd" LP_SELECT("32", "64")
+#define MONITOR_PACKET_MAX (128u * 1024u)
 
 #ifdef __aarch64__
   #define ARCH_STR "arm64-v8a"
@@ -257,6 +258,100 @@ static int spawn_companion(char *restrict argv[], char *restrict name, int lib_f
   exit(0);
 }
 
+static bool monitor_packet_reserve(size_t *packet_size, size_t extra) {
+  if (*packet_size > MONITOR_PACKET_MAX || extra > MONITOR_PACKET_MAX - *packet_size) {
+    LOGE("Monitor packet exceeds %u bytes", MONITOR_PACKET_MAX);
+    return false;
+  }
+
+  *packet_size += extra;
+  return true;
+}
+
+static void monitor_packet_append(uint8_t **cursor, const void *data, size_t size) {
+  memcpy(*cursor, data, size);
+  *cursor += size;
+}
+
+/* SOCK_DGRAM preserves datagram boundaries. A logical message therefore has
+   to be sent as one datagram: splitting the fields lets the independently
+   starting 32-bit and 64-bit daemons interleave their payloads. */
+static bool send_monitor_error(const char *message) {
+  size_t message_size = strlen(message);
+  if (message_size > UINT32_MAX) return false;
+
+  size_t packet_size = 0;
+  if (!monitor_packet_reserve(&packet_size, sizeof(uint8_t)) ||
+      !monitor_packet_reserve(&packet_size, sizeof(uint32_t)) ||
+      !monitor_packet_reserve(&packet_size, message_size)) {
+    return false;
+  }
+
+  uint8_t *packet = malloc(packet_size);
+  if (packet == NULL) {
+    LOGE("Failed to allocate monitor error packet: %s", strerror(errno));
+    return false;
+  }
+
+  uint8_t *cursor = packet;
+  uint8_t command = DAEMON_SET_ERROR_INFO;
+  uint32_t encoded_size = (uint32_t)message_size;
+  monitor_packet_append(&cursor, &command, sizeof(command));
+  monitor_packet_append(&cursor, &encoded_size, sizeof(encoded_size));
+  monitor_packet_append(&cursor, message, message_size);
+
+  bool sent = unix_datagram_sendto(CONTROLLER_SOCKET, packet, packet_size);
+  free(packet);
+  return sent;
+}
+
+static bool send_monitor_info(const struct Context *context, const char *root_impl) {
+  size_t root_impl_size = strlen(root_impl);
+  if (root_impl_size > UINT32_MAX || context->len > UINT32_MAX) return false;
+
+  size_t packet_size = 0;
+  if (!monitor_packet_reserve(&packet_size, sizeof(uint8_t)) ||
+      !monitor_packet_reserve(&packet_size, sizeof(uint32_t)) ||
+      !monitor_packet_reserve(&packet_size, root_impl_size) ||
+      !monitor_packet_reserve(&packet_size, sizeof(uint32_t))) {
+    return false;
+  }
+
+  for (size_t i = 0; i < context->len; i++) {
+    size_t module_name_size = strlen(context->modules[i].name);
+    if (module_name_size > UINT32_MAX ||
+        !monitor_packet_reserve(&packet_size, sizeof(uint32_t)) ||
+        !monitor_packet_reserve(&packet_size, module_name_size)) {
+      return false;
+    }
+  }
+
+  uint8_t *packet = malloc(packet_size);
+  if (packet == NULL) {
+    LOGE("Failed to allocate monitor info packet: %s", strerror(errno));
+    return false;
+  }
+
+  uint8_t *cursor = packet;
+  uint8_t command = DAEMON_SET_INFO;
+  uint32_t encoded_root_impl_size = (uint32_t)root_impl_size;
+  uint32_t encoded_module_count = (uint32_t)context->len;
+  monitor_packet_append(&cursor, &command, sizeof(command));
+  monitor_packet_append(&cursor, &encoded_root_impl_size, sizeof(encoded_root_impl_size));
+  monitor_packet_append(&cursor, root_impl, root_impl_size);
+  monitor_packet_append(&cursor, &encoded_module_count, sizeof(encoded_module_count));
+
+  for (size_t i = 0; i < context->len; i++) {
+    uint32_t module_name_size = (uint32_t)strlen(context->modules[i].name);
+    monitor_packet_append(&cursor, &module_name_size, sizeof(module_name_size));
+    monitor_packet_append(&cursor, context->modules[i].name, module_name_size);
+  }
+
+  bool sent = unix_datagram_sendto(CONTROLLER_SOCKET, packet, packet_size);
+  free(packet);
+  return sent;
+}
+
 /* WARNING: Dynamic memory based */
 void zygiskd_start(char *restrict argv[]) {
   /* INFO: When implementation is None or Multiple, it won't set the values
@@ -267,41 +362,24 @@ void zygiskd_start(char *restrict argv[]) {
   struct root_impl impl;
   get_impl(&impl);
   if (impl.impl == None || impl.impl == Multiple) {
-    unix_datagram_sendto(CONTROLLER_SOCKET, &(uint8_t){ DAEMON_SET_ERROR_INFO }, sizeof(uint8_t));
-
     const char *msg = NULL;
     if (impl.impl == None) msg = "Unsupported environment: Unknown root implementation";
     else msg = "Unsupported environment: Multiple root implementations found";
 
     LOGE("%s", msg);
-
-    uint32_t msg_len = (uint32_t)strlen(msg);
-    unix_datagram_sendto(CONTROLLER_SOCKET, &msg_len, sizeof(msg_len));
-    unix_datagram_sendto(CONTROLLER_SOCKET, msg, msg_len);
+    if (!send_monitor_error(msg)) LOGE("Failed to send daemon error to monitor");
 
     exit(EXIT_FAILURE);
   } else {
     load_modules(&context);
 
-    unix_datagram_sendto(CONTROLLER_SOCKET, &(uint8_t){ DAEMON_SET_INFO }, sizeof(uint8_t));
-
     char impl_name[LONGEST_ROOT_IMPL_NAME];
     stringify_root_impl_name(impl, impl_name);
-
-    uint32_t root_impl_len = (uint32_t)strlen(impl_name);
-    unix_datagram_sendto(CONTROLLER_SOCKET, &root_impl_len, sizeof(root_impl_len));
-    unix_datagram_sendto(CONTROLLER_SOCKET, impl_name, root_impl_len);
-
-    uint32_t modules_len = (uint32_t)context.len;
-    unix_datagram_sendto(CONTROLLER_SOCKET, &modules_len, sizeof(modules_len));
-
-    for (size_t i = 0; i < context.len; i++) {
-      uint32_t module_name_len = (uint32_t)strlen(context.modules[i].name);
-      unix_datagram_sendto(CONTROLLER_SOCKET, &module_name_len, sizeof(module_name_len));
-      unix_datagram_sendto(CONTROLLER_SOCKET, context.modules[i].name, module_name_len);
+    if (send_monitor_info(&context, impl_name)) {
+      LOGI("Sent atomic root implementation and modules information to controller socket");
+    } else {
+      LOGE("Failed to send daemon information to monitor");
     }
-
-    LOGI("Sent root implementation and modules information to controller socket");
   }
 
   int socket_fd = create_daemon_socket();

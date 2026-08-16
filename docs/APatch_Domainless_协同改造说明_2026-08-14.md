@@ -735,3 +735,33 @@ i17/554 已实现上述契约：`UpdateMountNamespace` 响应改成“状态字�
 entries 和 99 组 payload/sidecar 是发布门禁；最终文件名、大小与 SHA-256 统一记录在工作区交接 102，
 不在本仓库提交内形成“包哈希依赖提交、提交又依赖包哈希”的循环。当前设备未连接，本节结论仅到
 “构建候选”；完整重启前不得把 namespace EACCES 消失或 Hunter VMA 清零写成已通过。
+
+### 9.23 i17 与 CkbSmartN 并发启动暴露的 Monitor 数据报协议缺陷
+
+i17 单独启用时系统正常启动，Monitor、64 位和 32 位状态均为绿色；恢复 CkbSmartN、继续保持 Zygisk
+Assistant 禁用后，系统仍完成启动、双 `zygiskd` 和 `lspd` 也实际存活，但状态页把两个 daemon 都显示为
+`not running`。同一时刻 `zygisk-ptrace64 monitor-domainless` 持续输出：
+
+```text
+Got EAGAIN while reading from fd 4, retrying...
+```
+
+真机日志尾部 2000 行中有 916 行该警告。Assistant 在本轮差分中始终禁用，因此它不是这个故障的触发
+代码；CkbSmartN 只是增加了上报的模块字段，使原有竞态稳定暴露。
+
+根因是 Monitor 使用非阻塞 `SOCK_DGRAM`，但 i17 的 64 位和 32 位 daemon 各自把一条状态消息拆成多个
+独立 `sendto()`：命令、root 长度、root 字符串、模块数以及每个模块的长度和名称。两个 daemon 并发启动
+时，这些数据报可以在接收队列中交错。接收端读取命令后又用面向字节流的 `read_loop()` 继续拼字段，
+不仅可能把另一 ABI 的字段当成本消息，还会在队列暂时为空时无限重试 `EAGAIN`。`SOCK_DGRAM` 的消息
+边界不能按 `SOCK_STREAM` 方式解析，这是通用协议错误，不是某个插件需要特殊分支。
+
+i18/555 把 daemon info 和 error info 分别编码为单个原子数据报；Monitor 先用
+`recvmsg(MSG_PEEK|MSG_TRUNC|MSG_DONTWAIT)` 获取一条完整数据报长度，再一次性接收并在内存中做有界解析。
+消息最大 128 KiB，字符串最大 `PATH_MAX`，模块数最大 4096；短包、超长包、尾随字节和分配失败都
+fail-closed 丢弃，不再进入 `read_loop()`。新环境信息全部解析成功后才原子替换旧状态，发送函数也返回
+真实 `sendto()` 结果。四 ABI Release 编译已经通过；真机刷入并完整重启前，i18 仍只能标记为构建候选。
+
+当前 i17 设备虽然 `sys.boot_completed=1` 且 ADB 可用，但仍在产生 EAGAIN 日志洪泛，不应作为长期运行
+基线。ADB 序列号显示 `unknown` 来自 CkbSmartN 的属性隐藏行为，不等于 ADB 断连。验证顺序必须是：
+先用 i18 + CkbSmartN、保持 Assistant 禁用完成冷启动和状态验收；确认日志洪泛消失、双 daemon 变绿后，
+再单独恢复 Assistant 做第二次重启和 Hunter 排除复验。

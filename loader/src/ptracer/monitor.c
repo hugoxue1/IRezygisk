@@ -143,6 +143,97 @@ void monitor_events_loop() {
 
 int monitor_sock_fd;
 
+#define MONITOR_PACKET_MAX (128u * 1024u)
+#define MONITOR_STRING_MAX PATH_MAX
+#define MONITOR_MODULES_MAX 4096u
+
+struct monitor_packet_reader {
+  const uint8_t *data;
+  size_t size;
+  size_t offset;
+};
+
+static bool monitor_packet_read(struct monitor_packet_reader *reader, void *output, size_t size) {
+  if (reader->offset > reader->size || size > reader->size - reader->offset) return false;
+
+  memcpy(output, reader->data + reader->offset, size);
+  reader->offset += size;
+  return true;
+}
+
+static bool monitor_packet_read_u32(struct monitor_packet_reader *reader, uint32_t *output) {
+  return monitor_packet_read(reader, output, sizeof(*output));
+}
+
+static void free_environment_information(struct environment_information *information) {
+  free(information->root_impl);
+  information->root_impl = NULL;
+
+  if (information->modules != NULL) {
+    for (uint32_t i = 0; i < information->modules_len; i++) free(information->modules[i]);
+    free(information->modules);
+  }
+
+  information->modules = NULL;
+  information->modules_len = 0;
+}
+
+static bool monitor_packet_read_string(struct monitor_packet_reader *reader, char **output) {
+  uint32_t string_len = 0;
+  *output = NULL;
+
+  if (!monitor_packet_read_u32(reader, &string_len) ||
+      string_len == 0 || string_len > MONITOR_STRING_MAX) {
+    return false;
+  }
+
+  char *value = malloc((size_t)string_len + 1u);
+  if (value == NULL) {
+    PLOGE("allocate monitor string");
+    return false;
+  }
+
+  if (!monitor_packet_read(reader, value, string_len)) {
+    free(value);
+    return false;
+  }
+
+  value[string_len] = '\0';
+  *output = value;
+  return true;
+}
+
+static bool monitor_packet_read_environment(
+    struct monitor_packet_reader *reader,
+    struct environment_information *information) {
+  memset(information, 0, sizeof(*information));
+
+  if (!monitor_packet_read_string(reader, &information->root_impl) ||
+      !monitor_packet_read_u32(reader, &information->modules_len) ||
+      information->modules_len > MONITOR_MODULES_MAX) {
+    goto invalid_packet;
+  }
+
+  if (information->modules_len != 0) {
+    information->modules = calloc(information->modules_len, sizeof(*information->modules));
+    if (information->modules == NULL) {
+      PLOGE("allocate monitor module list");
+      goto invalid_packet;
+    }
+  }
+
+  for (uint32_t i = 0; i < information->modules_len; i++) {
+    if (!monitor_packet_read_string(reader, &information->modules[i])) goto invalid_packet;
+  }
+
+  if (reader->offset != reader->size) goto invalid_packet;
+  return true;
+
+invalid_packet:
+  free_environment_information(information);
+  return false;
+}
+
 bool rezygiskd_listener_init() {
   monitor_sock_fd = socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (monitor_sock_fd == -1) {
@@ -170,15 +261,55 @@ bool rezygiskd_listener_init() {
 
 void rezygiskd_listener_callback() {
   while (1) {
-    uint8_t cmd;
-    ssize_t nread = TEMP_FAILURE_RETRY(read(monitor_sock_fd, &cmd, sizeof(cmd)));
-    if (nread == -1) {
+    uint8_t probe = 0;
+    struct iovec probe_iov = {
+      .iov_base = &probe,
+      .iov_len = sizeof(probe)
+    };
+    struct msghdr probe_message = {
+      .msg_iov = &probe_iov,
+      .msg_iovlen = 1
+    };
+    ssize_t packet_size = TEMP_FAILURE_RETRY(
+      recvmsg(monitor_sock_fd, &probe_message, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT));
+    if (packet_size == -1) {
       if (errno == EINTR || errno == EWOULDBLOCK) break;
 
-      PLOGE("read socket");
+      PLOGE("peek monitor packet");
+
+      break;
+    }
+
+    if (packet_size <= 0 || packet_size > (ssize_t)MONITOR_PACKET_MAX) {
+      /* A short receive consumes and discards the complete datagram. */
+      (void)TEMP_FAILURE_RETRY(recv(monitor_sock_fd, &probe, sizeof(probe), MSG_DONTWAIT));
+      LOGE("Discard invalid monitor packet of %zd bytes", packet_size);
 
       continue;
     }
+
+    uint8_t *packet = malloc((size_t)packet_size);
+    if (packet == NULL) {
+      (void)TEMP_FAILURE_RETRY(recv(monitor_sock_fd, &probe, sizeof(probe), MSG_DONTWAIT));
+      PLOGE("allocate monitor packet");
+      continue;
+    }
+
+    ssize_t nread = TEMP_FAILURE_RETRY(
+      recv(monitor_sock_fd, packet, (size_t)packet_size, MSG_DONTWAIT));
+    if (nread != packet_size) {
+      if (nread == -1) PLOGE("receive monitor packet");
+      else LOGE("Short monitor packet: expected %zd, got %zd", packet_size, nread);
+      free(packet);
+      continue;
+    }
+
+    uint8_t cmd = packet[0];
+    struct monitor_packet_reader reader = {
+      .data = packet,
+      .size = (size_t)packet_size,
+      .offset = sizeof(cmd)
+    };
 
     switch (cmd) {
       case START: {
@@ -240,116 +371,29 @@ void rezygiskd_listener_callback() {
         struct rezygiskd_status *daemon_status =
           cmd == DAEMON64_SET_INFO ? &status64 : &status32;
 
-        uint32_t root_impl_len;
-        if (read_uint32_t(monitor_sock_fd, &root_impl_len) != sizeof(root_impl_len)) {
-          LOGE("read ReZygiskd%s root impl len", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
+        struct environment_information new_information;
+        if (!monitor_packet_read_environment(&reader, &new_information)) {
+          LOGE("Invalid ReZygiskd%s monitor information packet",
+               cmd == DAEMON64_SET_INFO ? "64" : "32");
           break;
         }
 
-        struct environment_information *environment_information = cmd == DAEMON64_SET_INFO ? &environment_information64 : &environment_information32;
-        if (environment_information->root_impl) {
-          LOGD("freeing old ReZygiskd%s root impl", cmd == DAEMON64_SET_INFO ? "64" : "32");
+        struct environment_information *environment_information =
+          cmd == DAEMON64_SET_INFO ? &environment_information64 : &environment_information32;
+        free_environment_information(environment_information);
+        *environment_information = new_information;
 
-          free((void *)environment_information->root_impl);
-          environment_information->root_impl = NULL;
+        LOGD("ReZygiskd%s root impl: %s", cmd == DAEMON64_SET_INFO ? "64" : "32",
+             environment_information->root_impl);
+        for (uint32_t i = 0; i < environment_information->modules_len; i++) {
+          LOGD("ReZygiskd%s module %u: %s", cmd == DAEMON64_SET_INFO ? "64" : "32", i,
+               environment_information->modules[i]);
         }
 
-        environment_information->root_impl = malloc(root_impl_len + 1);
-        if (environment_information->root_impl == NULL) {
-          PLOGE("malloc ReZygiskd%s root impl", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-          break;
-        }
-
-        if (read_loop(monitor_sock_fd, (void *)environment_information->root_impl, root_impl_len) != (ssize_t)root_impl_len) {
-          LOGE("read ReZygiskd%s root impl", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-          free((void *)environment_information->root_impl);
-          environment_information->root_impl = NULL;
-
-          break;
-        }
-
-        environment_information->root_impl[root_impl_len] = '\0';
-        LOGD("ReZygiskd%s root impl: %s", cmd == DAEMON64_SET_INFO ? "64" : "32", environment_information->root_impl);
-
-        if (read_uint32_t(monitor_sock_fd, &environment_information->modules_len) != sizeof(environment_information->modules_len)) {
-          LOGE("read ReZygiskd%s modules len", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-          free((void *)environment_information->root_impl);
-          environment_information->root_impl = NULL;
-
-          break;
-        }
-
-        if (environment_information->modules) {
-          LOGD("freeing old ReZygiskd%s modules", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-          for (size_t i = 0; i < environment_information->modules_len; i++) {
-            free((void *)environment_information->modules[i]);
-          }
-
-          free((void *)environment_information->modules);
-          environment_information->modules = NULL;
-        }
-
-        environment_information->modules = malloc(environment_information->modules_len * sizeof(char *));
-        if (environment_information->modules == NULL) {
-          PLOGE("malloc ReZygiskd%s modules", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-          free((void *)environment_information->root_impl);
-          environment_information->root_impl = NULL;
-
-          break;
-        }
-
-        bool info_complete = true;
-        for (size_t i = 0; i < environment_information->modules_len; i++) {
-          uint32_t module_name_len;
-          if (read_uint32_t(monitor_sock_fd, &module_name_len) != sizeof(module_name_len)) {
-            LOGE("read ReZygiskd%s module name len", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-            goto set_info_modules_cleanup;
-          }
-
-          environment_information->modules[i] = malloc(module_name_len + 1);
-          if (environment_information->modules[i] == NULL) {
-            PLOGE("malloc ReZygiskd%s module name", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-            goto set_info_modules_cleanup;
-          }
-
-          if (read_loop(monitor_sock_fd, (void *)environment_information->modules[i], module_name_len) != (ssize_t)module_name_len) {
-            LOGE("read ReZygiskd%s module name", cmd == DAEMON64_SET_INFO ? "64" : "32");
-
-            goto set_info_modules_cleanup;
-          }
-
-          environment_information->modules[i][module_name_len] = '\0';
-          LOGD("ReZygiskd%s module %zu: %s", cmd == DAEMON64_SET_INFO ? "64" : "32", i, environment_information->modules[i]);
-
-          continue;
-
-          set_info_modules_cleanup:
-            info_complete = false;
-            free((void *)environment_information->root_impl);
-            environment_information->root_impl = NULL;
-
-            for (size_t j = 0; j < i; j++) {
-              free((void *)environment_information->modules[j]);
-            }
-
-            free((void *)environment_information->modules);
-            environment_information->modules = NULL;
-
-            break;
-        }
-
-        if (info_complete) {
-          daemon_status->daemon_running = true;
-          LOGI("ReZygiskd%s readiness confirmed", cmd == DAEMON64_SET_INFO ? "64" : "32");
-        }
+        daemon_status->daemon_running = true;
+        free(daemon_status->daemon_error_info);
+        daemon_status->daemon_error_info = NULL;
+        LOGI("ReZygiskd%s readiness confirmed", cmd == DAEMON64_SET_INFO ? "64" : "32");
 
         update_status(NULL);
 
@@ -359,38 +403,17 @@ void rezygiskd_listener_callback() {
       case DAEMON32_SET_ERROR_INFO: {
         LOGD("Received ReZygiskd%s error info", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
 
-        uint32_t error_info_len;
-        if (read_uint32_t(monitor_sock_fd, &error_info_len) != sizeof(error_info_len)) {
-          LOGE("read ReZygiskd%s error info len", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
-
+        char *new_error_info = NULL;
+        if (!monitor_packet_read_string(&reader, &new_error_info) || reader.offset != reader.size) {
+          LOGE("Invalid ReZygiskd%s monitor error packet",
+               cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
+          free(new_error_info);
           break;
         }
 
         struct rezygiskd_status *status = cmd == DAEMON64_SET_ERROR_INFO ? &status64 : &status32;
-        if (status->daemon_error_info) {
-          LOGD("freeing old ReZygiskd%s error info", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
-
-          free(status->daemon_error_info);
-          status->daemon_error_info = NULL;
-        }
-
-        status->daemon_error_info = malloc(error_info_len + 1);
-        if (status->daemon_error_info == NULL) {
-          PLOGE("malloc ReZygiskd%s error info", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
-
-          break;
-        }
-
-        if (read_loop(monitor_sock_fd, status->daemon_error_info, error_info_len) != (ssize_t)error_info_len) {
-          LOGE("read ReZygiskd%s error info", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32");
-
-          free(status->daemon_error_info);
-          status->daemon_error_info = NULL;
-
-          break;
-        }
-
-        status->daemon_error_info[error_info_len] = '\0';
+        free(status->daemon_error_info);
+        status->daemon_error_info = new_error_info;
         LOGD("ReZygiskd%s error info: %s", cmd == DAEMON64_SET_ERROR_INFO ? "64" : "32", status->daemon_error_info);
 
         update_status(NULL);
@@ -398,6 +421,9 @@ void rezygiskd_listener_callback() {
         break;
       }
     }
+
+    free(packet);
+    if (!monitor_events_running) break;
   }
 }
 

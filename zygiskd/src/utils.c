@@ -135,12 +135,12 @@ static bool get_current_attr(char *restrict output, size_t size) {
   return true;
 }
 
-void unix_datagram_sendto(const char *restrict path, const void *restrict buf, size_t len) {
+bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, size_t len) {
   char current_attr[PATH_MAX];
   if (!get_current_attr(current_attr, sizeof(current_attr))) {
     LOGE("Failed to get current attribute");
 
-    return;
+    return false;
   }
 
   set_socket_create_context(current_attr);
@@ -156,7 +156,7 @@ void unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
 
     set_socket_create_context("u:r:zygote:s0");
 
-    return;
+    return false;
   }
 
   if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
@@ -166,7 +166,7 @@ void unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
 
     set_socket_create_context("u:r:zygote:s0");
 
-    return;
+    return false;
   }
 
   if (sendto(socket_fd, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
@@ -176,12 +176,13 @@ void unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
 
     set_socket_create_context("u:r:zygote:s0");
 
-    return;
+    return false;
   }
 
   set_socket_create_context("u:r:zygote:s0");
 
   close(socket_fd);
+  return true;
 }
 
 int chcon(const char *restrict path, const char *context) {
