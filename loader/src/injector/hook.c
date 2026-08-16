@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <dlfcn.h>
+#include <android/dlext.h>
 #include <regex.h>
 
 #include <dirent.h>
@@ -236,6 +237,43 @@ static bool update_mnt_ns(enum mount_namespace_state mns_state, bool dry_run) {
 */
 DCL_HOOK_FUNC(int, fork) {
   return (g_ctx && g_ctx->pid >= 0) ? g_ctx->pid : old_fork();
+}
+
+static bool is_self_fd_directory(DIR *dir) {
+  int fd = dirfd(dir);
+  if (fd < 0) return false;
+
+  char fd_link[64];
+  char target[PATH_MAX];
+  snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
+  ssize_t length = readlink(fd_link, target, sizeof(target) - 1);
+  if (length < 0 || (size_t)length >= sizeof(target)) return false;
+  target[length] = '\0';
+
+  char expected[64];
+  snprintf(expected, sizeof(expected), "/proc/%d/fd", getpid());
+  return strcmp(target, "/proc/self/fd") == 0 || strcmp(target, expected) == 0;
+}
+
+/* nativeForkSystemServer and nativeForkUsap build fds_to_ignore internally and
+   do not expose a JNI array that ReZygisk can extend. Hide only our private
+   control descriptor from Android's /proc/self/fd enumeration while the
+   descriptor exists. App forks still receive the explicit fds_to_ignore entry. */
+DCL_HOOK_FUNC(struct dirent *, readdir, DIR *dir) {
+  for (;;) {
+    struct dirent *entry = old_readdir(dir);
+    if (entry == NULL) return entry;
+
+    int control_fd = rezygiskd_get_domainless_session_fd();
+    if (control_fd < 0) return entry;
+
+    char control_name[16];
+    snprintf(control_name, sizeof(control_name), "%d", control_fd);
+    if (strcmp(entry->d_name, control_name) != 0 || !is_self_fd_directory(dir))
+      return entry;
+
+    LOGV("Hiding internal domainless fd %d from Zygote FD scan", control_fd);
+  }
 }
 
 /* INFO: file_path is a std::string in the actual class. We represent it as opaque bytes. */
@@ -879,13 +917,39 @@ static void mark_fds_allowed(struct zygisk_context *ctx, JNIEnv *env, jintArray 
 static void rz_sanitize_fds(struct zygisk_context *ctx) {
   if (FLAG_GET(ctx, SKIP_FD_SANITIZATION)) return;
 
+  int control_fd = rezygiskd_get_domainless_session_fd();
+  if (control_fd >= 0 && control_fd < MAX_FD_SIZE)
+    ctx->allowed_fds[control_fd] = 1;
+
   if (FLAG_GET(ctx, APP_FORK_AND_SPECIALIZE)) {
     jintArray fdsToIgnore = ctx->args.app->fds_to_ignore ? *ctx->args.app->fds_to_ignore : NULL;
     mark_fds_allowed(ctx, ctx->env, fdsToIgnore);
 
-    if (ctx->exempted_fds_count > 0) {
+    jint extra_fds[MAX_EXEMPTED_FDS + 1];
+    size_t extra_fds_count = 0;
+    for (size_t i = 0; i < ctx->exempted_fds_count; i++)
+      extra_fds[extra_fds_count++] = ctx->exempted_fds[i];
+
+    /* A connected AF_UNIX client socket has no filesystem name on its local
+       endpoint unless it was explicitly bound. Android's Zygote FD table
+       rejects unlisted sockets before fork. Keep the private control channel
+       available for trusted callbacks, but tell Android not to inspect or
+       reopen it. The child closes it immediately after post-specialize. */
+    if (control_fd >= 0) {
+      bool duplicate = false;
+      for (size_t i = 0; i < extra_fds_count; i++) {
+        if (extra_fds[i] == control_fd) duplicate = true;
+      }
+      if (!duplicate) extra_fds[extra_fds_count++] = control_fd;
+      if (control_fd < MAX_FD_SIZE) ctx->allowed_fds[control_fd] = 1;
+    }
+
+    /* Android L does not expose fds_to_ignore. It is still safe because the
+       pre-exec channel has an explicit abstract local socket name; only write
+       through the pointer on platform signatures that actually provide it. */
+    if (ctx->args.app->fds_to_ignore != NULL && extra_fds_count > 0) {
       jint len = fdsToIgnore ? (*ctx->env)->GetArrayLength(ctx->env, fdsToIgnore) : 0;
-      jintArray newArray = (*ctx->env)->NewIntArray(ctx->env, (jsize)(len + ctx->exempted_fds_count));
+      jintArray newArray = (*ctx->env)->NewIntArray(ctx->env, (jsize)(len + extra_fds_count));
       if (newArray) {
         if (fdsToIgnore && len > 0) {
           jint *arr = (*ctx->env)->GetIntArrayElements(ctx->env, fdsToIgnore, NULL);
@@ -894,9 +958,10 @@ static void rz_sanitize_fds(struct zygisk_context *ctx) {
           (*ctx->env)->DeleteLocalRef(ctx->env, fdsToIgnore);
         }
 
-        (*ctx->env)->SetIntArrayRegion(ctx->env, newArray, len, (jsize)ctx->exempted_fds_count, ctx->exempted_fds);
-        for (size_t i = 0; i < ctx->exempted_fds_count; i++) {
-          int fd = ctx->exempted_fds[i];
+        (*ctx->env)->SetIntArrayRegion(ctx->env, newArray, len,
+                                      (jsize)extra_fds_count, extra_fds);
+        for (size_t i = 0; i < extra_fds_count; i++) {
+          int fd = extra_fds[i];
           if (fd >= 0 && fd < MAX_FD_SIZE) ctx->allowed_fds[fd] = 1;
         }
 
@@ -954,38 +1019,79 @@ static bool load_modules_only(void) {
 
   for (size_t i = 0; i < ms.modules_count; i++) {
     const char *lib_path = ms.modules[i];
+    /* Successfully loaded modules stay in daemon order while failed entries
+       are removed immediately. The live daemon index therefore equals the
+       number of modules already retained, not the immutable snapshot index. */
+    size_t daemon_module_index = zygisk_module_length;
+    struct rezygisk_module *module = &zygisk_modules[zygisk_module_length];
+    memset(module, 0, sizeof(*module));
 
-    if (!csoloader_load(&zygisk_modules[zygisk_module_length].lib, lib_path)) {
-      LOGE("Failed to load module [%s]", lib_path);
+    bool loaded_by_csoloader = csoloader_load(&module->lib, lib_path);
+    if (!loaded_by_csoloader) {
+      /* Some valid Zygisk modules contain large or unusual C++ relocation and
+         constructor graphs that CSOLoader cannot reproduce in Zygote even
+         though Android's linker accepts them.  Retry through an fd so linker
+         namespaces and the /data/adb path do not become compatibility gates. */
+      LOGW("CSOLoader rejected module [%s]; retrying with Android linker", lib_path);
 
-      /* INFO: In case a module failed to load, update the list of available modules
-           in ReZygiskd to avoid a mismatch between the loaded modules in ReZygisk
-           Zygote library and the available modules in ReZygiskd. */
-      /* TODO: Update the list of modules for ReZygisk monitor, so that it can update
-                 for WebUI. That is simply cosmetic, though. */
-      rezygiskd_remove_module(i);
+      int library_fd = ms.module_fds[i];
+      module->android_linker_path = strdup(lib_path);
+      if (!module->android_linker_path) {
+        LOGE("Failed to retain Android linker module path [%s]", lib_path);
+      } else if (library_fd >= 0) {
+        android_dlextinfo extinfo = {
+          .flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD,
+          .library_fd = library_fd
+        };
+        module->android_linker_handle =
+          android_dlopen_ext(module->android_linker_path,
+                             RTLD_NOW | RTLD_LOCAL, &extinfo);
+      }
 
-      continue;
+      if (!module->android_linker_handle) {
+        LOGE("Android linker fallback failed for module [%s]: %s",
+             lib_path, dlerror());
+        free(module->android_linker_path);
+        memset(module, 0, sizeof(*module));
+
+        /* INFO: In case a module failed to load, update the list of available modules
+             in ReZygiskd to avoid a mismatch between the loaded modules in ReZygisk
+             Zygote library and the available modules in ReZygiskd. */
+        rezygiskd_remove_module(daemon_module_index);
+
+        continue;
+      }
+
+      LOGI("Loaded module [%s] with Android linker fallback", lib_path);
     }
 
-    void *entry = csoloader_get_symbol(&zygisk_modules[zygisk_module_length].lib, "zygisk_module_entry");
+    void *entry = loaded_by_csoloader
+      ? csoloader_get_symbol(&module->lib, "zygisk_module_entry")
+      : dlsym(module->android_linker_handle, "zygisk_module_entry");
     if (!entry) {
       LOGE("Failed to find entry point in module [%s]", lib_path);
 
-      csoloader_unload(&zygisk_modules[zygisk_module_length].lib);
+      if (loaded_by_csoloader) {
+        csoloader_unload(&module->lib);
+      } else {
+        /* A constructor may already have hidden the library from Android's
+           solist. Retaining an inert mapping is safer than dlclose(handle). */
+        free(module->android_linker_path);
+      }
+      memset(module, 0, sizeof(*module));
 
-      rezygiskd_remove_module(i);
+      rezygiskd_remove_module(daemon_module_index);
 
       continue;
     }
 
-    zygisk_modules[zygisk_module_length].api.register_module = rezygisk_module_register;
-    zygisk_modules[zygisk_module_length].api.impl = ENCODE_ID((void *)zygisk_module_length);
-    zygisk_modules[zygisk_module_length].zygisk_module_entry = (void (*)(void *, void *))entry;
+    module->api.register_module = rezygisk_module_register;
+    module->api.impl = ENCODE_ID((void *)zygisk_module_length);
+    module->zygisk_module_entry = (void (*)(void *, void *))entry;
 
     LOGD("Loaded module [%s]. Entry: %p", lib_path, entry);
 
-    zygisk_modules[zygisk_module_length].unload = false;
+    module->unload = false;
     zygisk_module_length++;
   }
 
@@ -1014,10 +1120,30 @@ static void rz_run_modules_post(struct zygisk_context *ctx) {
     else if (FLAG_GET(ctx, SERVER_FORK_AND_SPECIALIZE)) rz_module_call_post_server_specialize(m, ctx->args.server);
 
     if (!m->unload) {
-      LOGD("Abandoning module library at %p", &m->lib);
+      if (m->android_linker_handle) {
+        /* Android's linker owns this mapping. Keep it alive because module
+           hooks may still point into it after post-specialize. */
+        LOGD("Keeping Android-linker fallback module mapped: %s", rz_module_name(m));
+        free(m->android_linker_path);
+        m->android_linker_path = NULL;
+      } else {
+        LOGD("Abandoning module library at %p", &m->lib);
+        csoloader_abandon(&m->lib);
+      }
 
-      csoloader_abandon(&m->lib);
+      continue;
+    }
 
+    if (m->android_linker_handle) {
+      /* DLCLOSE_MODULE_LIBRARY is a hint. A fallback module can already have
+         removed itself from Android's solist, so dlclose(handle) is unsafe.
+         Leave the mapping in this short-lived child and count the logical
+         unload after ReZygisk drops all callbacks during rz_cleanup(). */
+      LOGD("Retaining Android-linker fallback module after unload request: %s",
+           rz_module_name(m));
+      free(m->android_linker_path);
+      m->android_linker_path = NULL;
+      modules_unloaded++;
       continue;
     }
 
@@ -1327,15 +1453,27 @@ static bool hook_unregister(const char *lib_name, const char *symbol, bool is_pr
 #define PLT_HOOK_UNREGISTER(LIB, SYM, IS_PREFIX)     \
   PLT_HOOK_UNREGISTER_SYM(LIB, #SYM, SYM, IS_PREFIX)
 
-void hook_functions(void) {
+bool hook_functions(bool require_domainless_fd_hook) {
   plti_init(&plti_ctx);
 
-  plti_add_lib(&plti_ctx, "libandroid_runtime.so");
+  if (!plti_add_lib(&plti_ctx, "libandroid_runtime.so")) return false;
 
-  PLT_HOOK_REGISTER("libandroid_runtime.so", fork, false);
+  bool fork_hooked = PLT_HOOK_REGISTER("libandroid_runtime.so", fork, false);
+  bool readdir_hooked = PLT_HOOK_REGISTER("libandroid_runtime.so", readdir, false);
+  if (require_domainless_fd_hook && (!fork_hooked || !readdir_hooked)) {
+    /* A persistent daemon descriptor without both fork emulation and the
+       precise FD-scan exclusion can make Android abort the Zygote. Roll back
+       every hook installed so far and reject the injection before init runs. */
+    if (readdir_hooked)
+      PLT_HOOK_UNREGISTER("libandroid_runtime.so", readdir, false);
+    if (fork_hooked)
+      PLT_HOOK_UNREGISTER("libandroid_runtime.so", fork, false);
+    return false;
+  }
   PLT_HOOK_REGISTER("libandroid_runtime.so", strdup, false);
   PLT_HOOK_REGISTER("libandroid_runtime.so", property_get, false);
   PLT_HOOK_REGISTER_SYM("libandroid_runtime.so", "_ZNK18FileDescriptorInfo14ReopenOrDetach", _ZNK18FileDescriptorInfo14ReopenOrDetach, true);
+  return true;
 }
 
 static void hook_unloader(void) {
@@ -1359,6 +1497,7 @@ static void hook_unloader(void) {
 
 static void unhook_functions(void) {
   PLT_HOOK_UNREGISTER("libandroid_runtime.so", fork, false);
+  PLT_HOOK_UNREGISTER("libandroid_runtime.so", readdir, false);
   PLT_HOOK_UNREGISTER("libandroid_runtime.so", strdup, false);
   PLT_HOOK_UNREGISTER_SYM("libandroid_runtime.so", "_ZNK18FileDescriptorInfo14ReopenOrDetach", _ZNK18FileDescriptorInfo14ReopenOrDetach, true);
   PLT_HOOK_UNREGISTER("libart.so", pthread_attr_setstacksize, false);

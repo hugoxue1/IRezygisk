@@ -7,6 +7,7 @@ OBJ_ROOT = $(BUILD_DIR)/obj/$(BUILD_TYPE)/zygiskd
 OBJ_DIR = $(OBJ_ROOT)/$(ARCH)
 
 ZKSU_VERSION ?= $(VER_NAME)
+VERSION_STAMP = $(OBJ_DIR)/.version-$(subst /,_,$(ZKSU_VERSION))
 
 ifeq ($(BUILD_TYPE),release)
 	TYPE_CFLAGS = -O3 -ffast-math -flto
@@ -36,7 +37,7 @@ INCLUDES = -Isrc -Isrc/root_impl
 .PHONY: all arch clean
 
 all:
-	@for arch in $(ARCHS); do                                                                                  \
+	@set -e; for arch in $(ARCHS); do                                                                          \
 		$(MAKE) BUILD_TYPE=$(BUILD_TYPE) BUILD_DIR=$(BUILD_DIR) ARCH=$$arch ZKSU_VERSION=$(ZKSU_VERSION) arch; \
 	done
 
@@ -48,7 +49,12 @@ arch: $(BIN)
 clean:
 	rm -rf $(BUILD_DIR)/obj/$(BUILD_TYPE)/zygiskd
 
-$(OBJ_DIR)/%.o: src/%.c
+$(VERSION_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(OBJ_DIR)/.version-*
+	@touch $@
+
+$(OBJ_DIR)/%.o: src/%.c $(VERSION_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC_ARCH) $(ZYGISKD_CFLAGS) $(TYPE_CFLAGS) $(INCLUDES) -c $< -o $@
 

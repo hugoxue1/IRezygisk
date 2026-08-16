@@ -68,8 +68,11 @@ bool ptrace_poke_uintptr(pid_t pid, uintptr_t addr, uintptr_t value);
 
 bool wait_for_ptrace_syscall_stop(int pid, int *status);
 
-long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_gadget, long sysnr, long *args, size_t args_size);
+void ptrace_wait_set_deadline_ms(long timeout_ms);
 
+void ptrace_wait_clear_deadline(void);
+
+long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_gadget, long sysnr, long *args, size_t args_size);
 void tracee_skip_syscall(int pid);
 
 void wait_for_trace(int pid, int *status, int flags);

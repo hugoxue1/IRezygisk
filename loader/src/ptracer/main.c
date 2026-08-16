@@ -16,16 +16,42 @@ int main(int argc, char **argv) {
     init_domainless_monitor();
 
     return 0;
-  } else if (argc >= 3 && strcmp(argv[1], "trace-direct") == 0) {
+  } else if (argc >= 3 &&
+             (strcmp(argv[1], "trace-direct") == 0 ||
+              strcmp(argv[1], "trace-preexec") == 0 ||
+              strcmp(argv[1], "trace-postexec") == 0)) {
     bool is_tango = false;
+    uint32_t auth_ticket = 0;
+    int inherited_domainless_fd = -1;
+    bool target_is_64bit = sizeof(void *) == 8;
     for (int i = 3; i < argc; i++) {
       if (strcmp(argv[i], "--tango") == 0) is_tango = true;
+      else if (strcmp(argv[i], "--ticket") == 0 && i + 1 < argc) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || parsed == 0 || parsed > INT32_MAX) return 2;
+        auth_ticket = (uint32_t)parsed;
+      } else if (strcmp(argv[i], "--target-abi") == 0 && i + 1 < argc) {
+        const char *abi = argv[++i];
+        if (strcmp(abi, "64") == 0) target_is_64bit = true;
+        else if (strcmp(abi, "32") == 0) target_is_64bit = false;
+        else return 2;
+      } else if (strcmp(argv[i], "--domainless-fd") == 0 && i + 1 < argc) {
+        char *end = NULL;
+        long parsed = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || parsed < 0 || parsed > INT_MAX) return 2;
+        inherited_domainless_fd = (int)parsed;
+      }
     }
 
     long pid = strtol(argv[2], 0, 0);
     /* Domainless mode is deliberately fail-open for boot safety: a missed
        injection window must never kill or restart the real Zygote. */
-    return trace_zygote_direct(pid, is_tango) ? 0 : 1;
+    if (strcmp(argv[1], "trace-preexec") == 0)
+      return trace_zygote_preexec(pid, is_tango, auth_ticket, target_is_64bit) ? 0 : 1;
+    if (strcmp(argv[1], "trace-postexec") == 0)
+      return trace_zygote_postexec(pid, is_tango, inherited_domainless_fd) ? 0 : 1;
+    return trace_zygote_direct(pid, is_tango, auth_ticket) ? 0 : 1;
   } else if (argc >= 3 && strcmp(argv[1], "trace") == 0) {
       bool is_tango = false;
       bool do_restart = false;
@@ -123,6 +149,7 @@ int main(int argc, char **argv) {
       " - monitor-domainless\n"
       " - trace <pid> [--restart]\n"
       " - trace-direct <pid>\n"
+      " - trace-preexec <pid> --ticket <ticket>\n"
       " - ctl <start|stop|exit>\n"
       " - version: Shows the version of ReZygisk.\n"
       " - info: Shows information about the created daemon/injection.\n"

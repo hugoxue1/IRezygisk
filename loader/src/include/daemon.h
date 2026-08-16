@@ -20,6 +20,7 @@ enum rezygiskd_actions {
 
 struct zygisk_modules {
   char **modules;
+  int *module_fds;
   size_t modules_count;
 };
 
@@ -50,7 +51,9 @@ static inline const char *rezygiskd_get_path() {
 
 bool rezygiskd_zygote_injected();
 
-bool rezygiskd_init_domainless_session();
+bool rezygiskd_init_domainless_session(int inherited_fd);
+
+int rezygiskd_get_domainless_session_fd();
 
 void rezygiskd_release_domainless_session_in_child();
 

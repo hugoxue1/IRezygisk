@@ -1,4 +1,5 @@
 BUILD_DIR := $(CURDIR)/build
+PYTHON ?= python3
 
 include common.mk
 
@@ -75,10 +76,10 @@ $(MODULE_DONE): $(LOADER_DONE) $(ZYGISKD_DONE) $(MODULE_INPUTS)
 	   module/src/apatch-early-loader.json $(MODULE_OUT)/
 
 	@echo "Customizing module.prop..."
-	@sed -e 's/$${moduleId}/$(MODULE_ID)/g'                                             \
-	    -e 's/$${moduleName}/$(MODULE_NAME)/g'                                          \
-	    -e 's/$${versionName}/$(VER_NAME) ($(VER_CODE)-$(COMMIT_HASH)-$(BUILD_TYPE))/g' \
-	    -e 's/$${versionCode}/$(VER_CODE)/g'                                            \
+	@sed -e 's/@MODULE_ID@/$(MODULE_ID)/g'                                             \
+	    -e 's/@MODULE_NAME@/$(MODULE_NAME)/g'                                          \
+	    -e 's/@VERSION_NAME@/$(VER_NAME) ($(VER_CODE)-$(COMMIT_HASH)-$(BUILD_TYPE))/g' \
+	    -e 's/@VERSION_CODE@/$(VER_CODE)/g'                                            \
 	    module/src/module.prop > $(MODULE_OUT)/module.prop
 
 	@echo "Customizing scripts..."
@@ -105,10 +106,10 @@ $(MODULE_DONE): $(LOADER_DONE) $(ZYGISKD_DONE) $(MODULE_INPUTS)
 
 	@if [ -f module/private_key ]; then                                             \
 		echo "Signing module...";                                                   \
-		python3 scripts/sign.py $(MODULE_OUT) module/private_key module/public_key; \
+		$(PYTHON) scripts/sign.py $(MODULE_OUT) module/private_key module/public_key; \
 	else                                                                            \
-	    echo "No private key found, skipping signing...";                           \
-		python3 scripts/sign.py --no-sign $(MODULE_OUT);                            \
+		echo "No private key found, skipping signing...";                           \
+		$(PYTHON) scripts/sign.py --no-sign $(MODULE_OUT);                          \
 	fi
 
 	@mkdir -p $(dir $@)

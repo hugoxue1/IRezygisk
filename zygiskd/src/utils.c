@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -25,6 +26,23 @@
 bool switch_mount_namespace(pid_t pid) {
   char path[PATH_MAX];
   snprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
+
+  /* The APatch domainless daemon is launched from APD's global mount
+     namespace.  Re-entering the very same namespace is redundant and, on
+     older vendor 4.x kernels, can contend with init's concurrent post-fs-data
+     mount work badly enough to stop the boot before Zygote.  Compare the
+     namespace objects first; preserve the original setns path whenever the
+     caller really is in a different namespace. */
+  struct stat current_ns = { 0 };
+  struct stat target_ns = { 0 };
+  if (stat("/proc/self/ns/mnt", &current_ns) == 0 &&
+      stat(path, &target_ns) == 0 &&
+      current_ns.st_dev == target_ns.st_dev &&
+      current_ns.st_ino == target_ns.st_ino) {
+    LOGI("Mount namespace already matches PID %d; skipping setns", pid);
+
+    return true;
+  }
 
   int nsfd = open(path, O_RDONLY | O_CLOEXEC);
   if (nsfd == -1) {

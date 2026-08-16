@@ -22,6 +22,49 @@
 
 #include "utils.h"
 
+static bool ptrace_wait_deadline_enabled = false;
+static struct timespec ptrace_wait_deadline = { 0 };
+
+void ptrace_wait_set_deadline_ms(long timeout_ms) {
+  struct timespec now = { 0 };
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (timeout_ms < 1) timeout_ms = 1;
+  ptrace_wait_deadline.tv_sec = now.tv_sec + timeout_ms / 1000;
+  ptrace_wait_deadline.tv_nsec = now.tv_nsec + (timeout_ms % 1000) * 1000000L;
+  if (ptrace_wait_deadline.tv_nsec >= 1000000000L) {
+    ptrace_wait_deadline.tv_sec++;
+    ptrace_wait_deadline.tv_nsec -= 1000000000L;
+  }
+  ptrace_wait_deadline_enabled = true;
+}
+
+void ptrace_wait_clear_deadline(void) {
+  ptrace_wait_deadline_enabled = false;
+}
+
+static bool ptrace_wait_deadline_expired(void) {
+  struct timespec now = { 0 };
+  if (!ptrace_wait_deadline_enabled) return false;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return now.tv_sec > ptrace_wait_deadline.tv_sec ||
+         (now.tv_sec == ptrace_wait_deadline.tv_sec && now.tv_nsec >= ptrace_wait_deadline.tv_nsec);
+}
+
+static pid_t ptrace_waitpid(int pid, int *status, int flags) {
+  if (!ptrace_wait_deadline_enabled) return waitpid(pid, status, flags);
+
+  const struct timespec retry_delay = { .tv_sec = 0, .tv_nsec = 1000000L };
+  while (1) {
+    pid_t waited = waitpid(pid, status, flags | WNOHANG);
+    if (waited != 0) return waited;
+    if (ptrace_wait_deadline_expired()) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    nanosleep(&retry_delay, NULL);
+  }
+}
+
 ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len) {
   LOGV("write to remote addr %" PRIxPTR " size %zu", remote_addr, len);
 
@@ -739,7 +782,7 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
 
   struct timespec started = {};
   clock_gettime(CLOCK_MONOTONIC, &started);
-  int syscall_steps = 0;
+  unsigned long syscall_steps = 0;
 
   /* INFO: Loop till linker changes the value (resolves the symbol) */
   while (1) {
@@ -763,11 +806,24 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
     clock_gettime(CLOCK_MONOTONIC, &now);
     long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L +
                       (now.tv_nsec - started.tv_nsec) / 1000000L;
-    if (elapsed_ms > 2000L || syscall_steps++ >= 512) {
-      LOGE("Timed out waiting for __libc_init resolution for pid %d", pid);
+    /* The exact PTRACE_EVENT_EXEC rendezvous starts before Android's dynamic
+       linker has loaded and relocated app_process dependencies.  Counting
+       syscall stops is not a time bound: on an OEM linker a fast device can
+       consume hundreds of stops in a fraction of a second while still making
+       forward progress.  The old 512-stop guard therefore rejected both
+       Zygotes after roughly 150 ms on Android 11.
+
+       Wait for the observable relocation event instead.  The monotonic limit
+       remains below the caller's 4 s ptrace deadline, the 5.5 s monitor
+       watchdog and APD's 6 s staged-target watchdog, so a stalled linker still
+       fails open without pinning boot. */
+    if (elapsed_ms > 3500L) {
+      LOGE("Timed out waiting for __libc_init resolution for pid %d after %lu syscall stops",
+           pid, syscall_steps);
 
       return false;
     }
+    syscall_steps++;
 
     /* INFO: Step to the next syscall */
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
@@ -830,7 +886,7 @@ bool ptrace_poke_uintptr(pid_t pid, uintptr_t addr, uintptr_t value) {
 bool wait_for_ptrace_syscall_stop(int pid, int *status) {
   int step_retries = 0;
   while (1) {
-    pid_t waited = waitpid(pid, status, __WALL);
+    pid_t waited = ptrace_waitpid(pid, status, __WALL);
     if (waited == -1) {
       if (errno == EINTR) continue;
 
@@ -873,6 +929,21 @@ bool wait_for_ptrace_syscall_stop(int pid, int *status) {
       continue;
     }
 
+    /* SIGCONT wakes the init-created group-stop before its ordinary signal
+       delivery stop is reported.  Suppress the handler delivery and retain
+       PTRACE_SYSCALL so the remote call still reaches its entry/exit stops. */
+    if (stop_sig == SIGCONT && stop_event == 0) {
+      if (step_retries++ >= 4) {
+        LOGE("Remote syscall received repeated SIGCONT delivery stops");
+        return false;
+      }
+      if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+        PLOGE("PTRACE_SYSCALL after SIGCONT");
+        return false;
+      }
+      continue;
+    }
+
     if (is_syscall_stop) return true;
 
     char status_str[64];
@@ -883,7 +954,8 @@ bool wait_for_ptrace_syscall_stop(int pid, int *status) {
   }
 }
 
-long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_gadget, long sysnr, long *args, size_t args_size) {
+long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_gadget,
+                    long sysnr, long *args, size_t args_size) {
   LOGV("Remote syscall %ld args %zu at gadget %p", sysnr, args_size, (void *)syscall_gadget);
 
   long ret = -1;
@@ -1037,7 +1109,7 @@ void tracee_skip_syscall(int pid) {
 
 void wait_for_trace(int pid, int *status, int flags) {
   while (1) {
-    pid_t result = waitpid(pid, status, flags);
+    pid_t result = ptrace_waitpid(pid, status, flags);
     if (result == -1) {
       if (errno == EINTR) continue;
 

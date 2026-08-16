@@ -7,6 +7,7 @@ OBJ_ROOT = $(BUILD_DIR)/obj/$(BUILD_TYPE)/loader
 OBJ_DIR = $(OBJ_ROOT)/$(ARCH)
 
 ZKSU_VERSION ?= $(VER_NAME)-$(VER_CODE)-$(COMMIT_HASH)-$(BUILD_TYPE)
+VERSION_STAMP = $(OBJ_DIR)/.version-$(subst /,_,$(ZKSU_VERSION))
 
 ifeq ($(BUILD_TYPE),release)
 	TYPE_CFLAGS = -O3 -ffast-math -flto -Wno-unused -Wno-unused-parameter       \
@@ -55,7 +56,7 @@ INJECTOR_INCLUDES = -Isrc/include -I$(PLTI_DIR)/src -I$(CSOLOADER_DIR)/include
 .PHONY: all arch clean
 
 all:
-	@for arch in $(ARCHS); do                                                                                  \
+	@set -e; for arch in $(ARCHS); do                                                                          \
 		$(MAKE) BUILD_TYPE=$(BUILD_TYPE) BUILD_DIR=$(BUILD_DIR) ARCH=$$arch ZKSU_VERSION=$(ZKSU_VERSION) arch; \
 	done
 
@@ -81,17 +82,22 @@ $(CSOLOADER_LIB):
 		NDK_PATH=$(NDK_PATH) API_LEVEL=$(API_LEVEL)                   \
 		out=$(BUILD_DIR)/obj/$(BUILD_TYPE)/csoloader/$(ARCH)
 
-$(OBJ_DIR)/common/%.o: src/common/%.c
+$(VERSION_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(OBJ_DIR)/.version-*
+	@touch $@
+
+$(OBJ_DIR)/common/%.o: src/common/%.c $(VERSION_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC_ARCH) $(NDK_CFLAGS) $(LOADER_CFLAGS) $(TYPE_CFLAGS) \
 		$(COMMON_INCLUDES) -fPIC -c $< -o $@
 
-$(OBJ_DIR)/injector/%.o: src/injector/%.c
+$(OBJ_DIR)/injector/%.o: src/injector/%.c $(VERSION_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC_ARCH) $(NDK_CFLAGS) $(LOADER_CFLAGS) $(TYPE_CFLAGS) \
 		$(INJECTOR_INCLUDES) -Dzygisk_EXPORTS -fPIC -c $< -o $@
 
-$(OBJ_DIR)/ptracer/%.o: src/ptracer/%.c
+$(OBJ_DIR)/ptracer/%.o: src/ptracer/%.c $(VERSION_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC_ARCH) $(NDK_CFLAGS) $(LOADER_CFLAGS) $(TYPE_CFLAGS) \
 		$(COMMON_INCLUDES) -fPIE -c $< -o $@

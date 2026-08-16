@@ -370,8 +370,31 @@ void zygiskd_start(char *restrict argv[]) {
       }
 
       /* A private child services the inherited Zygote channel while the main
-         daemon remains available for status and a future Zygote restart. */
+         daemon remains available for status and a future Zygote restart.
+
+         The accepted client socket is labelled for the pre-exec init task.
+         It cannot be used after that task transitions to u:r:zygote:s0.  This
+         daemon's sockcreate context is already u:r:zygote:s0, so create the
+         persistent channel here and pass its peer to the pre-exec client via
+         SCM_RIGHTS.  Only the replacement endpoint crosses exec. */
       close(socket_fd);
+      int session_pair[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, session_pair) == -1) {
+        LOGE("create labelled domainless session pair: %s", strerror(errno));
+        write_uint8_t(client_fd, 0);
+        close(client_fd);
+        break;
+      }
+      if (write_fd(client_fd, session_pair[1]) == -1) {
+        LOGE("send labelled domainless session fd");
+        close(session_pair[0]);
+        close(session_pair[1]);
+        close(client_fd);
+        break;
+      }
+      close(session_pair[1]);
+      close(client_fd);
+      client_fd = session_pair[0];
       persistent_client = true;
       if (write_uint8_t(client_fd, 1) == -1) break;
       goto read_client_action;
@@ -507,6 +530,12 @@ void zygiskd_start(char *restrict argv[]) {
 
           if (write_string(client_fd, lib_path) == -1) {
             LOGE("Failed writing module path.");
+
+            break;
+          }
+
+          if (write_fd(client_fd, context.modules[i].lib_fd) == -1) {
+            LOGE("Failed writing module library fd.");
 
             break;
           }

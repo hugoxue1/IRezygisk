@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdatomic.h>
 
@@ -19,7 +20,6 @@
 #include "daemon.h"
 
 #define SOCKET_FILE_NAME LP_SELECT("cp32", "cp64") ".sock"
-#define DOMAINLESS_MARKER "/data/adb/modules/rezygisk/.apatch-domainless-v1"
 
 struct domainless_channel {
   _Atomic int owner;
@@ -132,39 +132,58 @@ static int rezygiskd_connect(uint8_t retry) {
   return -1;
 }
 
-bool rezygiskd_init_domainless_session() {
-  if (access(DOMAINLESS_MARKER, F_OK) == -1) return true;
-  if (domainless_session_fd >= 0) return true;
+bool rezygiskd_init_domainless_session(int inherited_fd) {
+  /* The entry argument is the mode boundary. Never probe the module marker
+     after exec: a correctly confined Zygote cannot traverse /data/adb, and an
+     EACCES result would incorrectly discard the pre-authenticated channel.
+     Legacy Magisk/KernelSU injection passes -1 and continues with its normal
+     per-request connections; APatch domainless injection always passes the
+     stream established before exec. */
+  if (inherited_fd < 0) return true;
+  if (domainless_session_fd >= 0) {
+    if (inherited_fd >= 0 && inherited_fd != domainless_session_fd) close(inherited_fd);
+    return true;
+  }
+
+  /* APatch domainless mode must not resolve /data/adb after exec: the task is
+     already in the Zygote SELinux domain at that point.  The pre-exec tracer
+     opens and authenticates this channel while the init service child still
+     has path access, then passes the non-CLOEXEC descriptor through exec. */
+  if (fcntl(inherited_fd, F_GETFD) == -1) {
+    PLOGE("validate inherited APatch domainless fd");
+    close(inherited_fd);
+    return false;
+  }
+
+  int socket_type = 0;
+  socklen_t socket_type_size = sizeof(socket_type);
+  struct sockaddr_un peer = { 0 };
+  socklen_t peer_size = sizeof(peer);
+  if (getsockopt(inherited_fd, SOL_SOCKET, SO_TYPE, &socket_type,
+                 &socket_type_size) == -1 || socket_type != SOCK_STREAM ||
+      getpeername(inherited_fd, (struct sockaddr *)&peer, &peer_size) == -1) {
+    LOGE("inherited APatch domainless fd is not a connected stream socket");
+    close(inherited_fd);
+    return false;
+  }
 
   struct domainless_channel *channel = mmap(NULL, sizeof(*channel), PROT_READ | PROT_WRITE,
                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (channel == MAP_FAILED) {
     PLOGE("mmap domainless channel");
-    return false;
-  }
-
-  int fd = rezygiskd_connect(5);
-  if (fd == -1) {
-    munmap(channel, sizeof(*channel));
-    return false;
-  }
-  if (write_uint8_t(fd, (uint8_t)DomainlessSession) == -1) {
-    close(fd);
-    munmap(channel, sizeof(*channel));
-    return false;
-  }
-
-  uint8_t accepted = 0;
-  if (read_uint8_t(fd, &accepted) == -1 || accepted != 1) {
-    close(fd);
-    munmap(channel, sizeof(*channel));
+    close(inherited_fd);
     return false;
   }
 
   domainless_channel = channel;
-  domainless_session_fd = fd;
-  LOGI("APatch domainless daemon session established");
+  domainless_session_fd = inherited_fd;
+  LOGI("APatch domainless daemon session adopted from pre-exec fd %d",
+       domainless_session_fd);
   return true;
+}
+
+int rezygiskd_get_domainless_session_fd() {
+  return domainless_session_fd;
 }
 
 void rezygiskd_release_domainless_session_in_child() {
@@ -355,15 +374,29 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
   size_t len = 0;
   safe_read(read_size_t(fd, &len), "modules count", return false);
 
+  if (len == 0) {
+    modules->modules = NULL;
+    modules->module_fds = NULL;
+    modules->modules_count = 0;
+    rezygiskd_disconnect(fd);
+    return true;
+  }
+
   modules->modules = malloc(len * sizeof(char *));
-  if (!modules->modules) {
+  modules->module_fds = malloc(len * sizeof(int));
+  if (!modules->modules || !modules->module_fds) {
     PLOGE("allocating modules name memory");
 
+    free(modules->modules);
+    free(modules->module_fds);
+    modules->modules = NULL;
+    modules->module_fds = NULL;
     rezygiskd_disconnect(fd);
 
     return false;
   }
   modules->modules_count = len;
+  for (size_t i = 0; i < len; i++) modules->module_fds[i] = -1;
 
   for (size_t i = 0; i < len; i++) {
     char *lib_path = read_string(fd);
@@ -379,6 +412,17 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
     }
 
     modules->modules[i] = lib_path;
+    modules->module_fds[i] = read_fd(fd);
+    if (modules->module_fds[i] < 0) {
+      PLOGE("reading module library fd");
+
+      modules->modules_count = i + 1;
+      free_modules(modules);
+
+      rezygiskd_disconnect(fd);
+
+      return false;
+    }
   }
 
   rezygiskd_disconnect(fd);
@@ -389,10 +433,14 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
 void free_modules(struct zygisk_modules *modules) {
   for (size_t i = 0; i < modules->modules_count; i++) {
     free(modules->modules[i]);
+    if (modules->module_fds && modules->module_fds[i] >= 0)
+      close(modules->module_fds[i]);
   }
 
   free(modules->modules);
+  free(modules->module_fds);
   modules->modules = NULL;
+  modules->module_fds = NULL;
   modules->modules_count = 0;
 }
 

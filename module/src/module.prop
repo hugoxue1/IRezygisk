@@ -1,7 +1,7 @@
-id=${moduleId}
-name=${moduleName}
-version=${versionName}
-versionCode=${versionCode}
+id=@MODULE_ID@
+name=@MODULE_NAME@
+version=@VERSION_NAME@
+versionCode=@VERSION_CODE@
 author=The PerformanC Organization / hugoxue1 customization
-description=Standalone implementation of Zygisk with APatch domainless-v1 support.
+description=Standalone implementation of Zygisk with APatch domainless-v1 exec-transition handoff support.
 managedFeatures=kernel_umount

@@ -36,15 +36,45 @@ static uintptr_t page_end(uintptr_t addr, size_t page_size) {
   return ALIGN_DOWN(addr + page_size - 1, page_size);
 }
 
-static long remote_mmap_offset_arg(off_t file_offset, size_t page_size) {
-  /* INFO: mmap2 needs the offset in page units, unlike mmap */
-  #ifdef __LP64__
-    (void) page_size;
+static bool copy_file_region_to_remote(int pid, int fd, off_t file_offset,
+                                       uintptr_t remote_addr, size_t length) {
+  const size_t max_chunk = 64 * 1024;
+  size_t chunk_size = length < max_chunk ? length : max_chunk;
+  unsigned char *buffer = chunk_size == 0 ? NULL : malloc(chunk_size);
+  if (chunk_size != 0 && buffer == NULL) {
+    LOGE("Failed to allocate anonymous loader transfer buffer");
+    return false;
+  }
 
-    return file_offset;
-  #else
-    return (long)(file_offset / (off_t)page_size);
-  #endif
+  size_t copied = 0;
+  while (copied < length) {
+    size_t wanted = length - copied;
+    if (wanted > chunk_size) wanted = chunk_size;
+
+    size_t received = 0;
+    while (received < wanted) {
+      ssize_t current = TEMP_FAILURE_RETRY(
+          pread(fd, buffer + received, wanted - received,
+                file_offset + (off_t)copied + (off_t)received));
+      if (current <= 0) {
+        if (current == 0) LOGE("Unexpected EOF while reading loader payload");
+        else PLOGE("pread loader payload");
+        free(buffer);
+        return false;
+      }
+      received += (size_t)current;
+    }
+
+    if (write_proc(pid, remote_addr + copied, buffer, wanted) != (ssize_t)wanted) {
+      LOGE("Failed to transfer anonymous loader payload at offset %zu", copied);
+      free(buffer);
+      return false;
+    }
+    copied += wanted;
+  }
+
+  free(buffer);
+  return true;
 }
 
 /* INFO: Parse ELF headers and compute the total mapping size for PT_LOAD segments. */
@@ -685,8 +715,6 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
                                              struct maps_info *remote_map, struct maps_info *local_map,
                                              const char *lib_path, uintptr_t *out_base,
                                              size_t *out_total_size, uintptr_t *out_entry) {
-  struct user_regs_struct regs_saved = *regs;
-
   long page_size_long = sysconf(_SC_PAGESIZE);
   if (page_size_long <= 0) {
     LOGE("sysconf(_SC_PAGESIZE) failed");
@@ -731,64 +759,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     return false;
   }
 
-  size_t path_len = strlen(lib_path) + 1;
-  uintptr_t remote_path = regs_saved.REG_SP - ALIGN_UP(path_len, 16);
-  if (write_proc(pid, remote_path, lib_path, path_len) != (ssize_t)path_len) {
-    LOGE("Failed to write remote path string to stack");
-
-    free(phdr);
-    close(fd);
-
-    return false;
-  }
-
-  /* INFO: Ensure remote_call's own stack usage stays below our string */
-  regs->REG_SP = remote_path;
-
   long args[6];
-  args[0] = AT_FDCWD;
-  args[1] = (long)remote_path;
-  args[2] = O_RDONLY | O_CLOEXEC;
-  args[3] = 0;
-
-  long remote_fd = remote_syscall(pid, regs, syscall_gadget, SYS_openat, args, 4);
-  if (remote_fd < 0) {
-    LOGE("Failed to open remote file: %s (%ld)", lib_path, remote_fd);
-
-    free(phdr);
-    close(fd);
-
-    return false;
-  }
-
-  void *remote_path_zerod = calloc(1, ALIGN_UP(path_len, 16));
-  if (!remote_path_zerod) {
-    LOGE("Failed to allocate memory for zeroed path");
-
-    args[0] = remote_fd;
-    remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-
-    free(phdr);
-    close(fd);
-
-    return false;
-  }
-
-  if (write_proc(pid, remote_path, remote_path_zerod, ALIGN_UP(path_len, 16)) != (ssize_t)ALIGN_UP(path_len, 16)) {
-    LOGE("Failed to zero remote path string on stack");
-
-    free(remote_path_zerod);
-
-    args[0] = remote_fd;
-    remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-
-    free(phdr);
-    close(fd);
-
-    return false;
-  }
-
-  free(remote_path_zerod);
 
   /* INFO: Request an LP64 base 4GiB+ so the mapping starts high and stays
              farther from the areas where the target process is more likely to
@@ -801,33 +772,25 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
   args[4] = -1;
   args[5] = 0;
 
-  uintptr_t remote_base = (uintptr_t)remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
-  if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) {
-    LOGE("remote mmap reserve failed: %p", (void *)remote_base);
-
-
-    args[0] = remote_fd;
-    remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
+  long remote_base_result = remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
+  if (remote_base_result <= 0 && remote_base_result >= -4095) {
+    LOGE("remote mmap reserve failed: %ld", remote_base_result);
 
     free(phdr);
     close(fd);
 
     return false;
   }
+  uintptr_t remote_base = (uintptr_t)remote_base_result;
 
 #ifdef __LP64__
   if (remote_base < min_addr) {
     LOGE("remote mmap reserve returned low base %p (< %p)", (void *)remote_base, (void *)min_addr);
 
-
     args[0] = (long)remote_base;
     args[1] = (long)map_size;
 
     remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
-
-    args[0] = remote_fd;
-
-    remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
 
     free(phdr);
     close(fd);
@@ -847,9 +810,26 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
 
   size_t segs_count = 0;
 
-  /* INFO: Map non-writable PT_LOAD from file */
+  /* Map every load range as anonymous writable memory first.  The tracer can
+     read the module file, while an already transitioned Zygote is correctly
+     forbidden from searching /data/adb by SELinux.  Making the tracee open or
+     mmap that path therefore couples injection to a task-auth token surviving
+     exec, which is not an Android/OEM contract.  Anonymous transfer preserves
+     the native policy boundary and also avoids a module pathname in maps. */
   for (int i = 0; i < eh.e_phnum; i++) {
     if (phdr[i].p_type != PT_LOAD) continue;
+    if (phdr[i].p_filesz > phdr[i].p_memsz || phdr[i].p_memsz == 0) {
+      if (phdr[i].p_filesz > phdr[i].p_memsz) {
+        LOGE("Invalid PT_LOAD file/memory sizes for phdr %d", i);
+        args[0] = (long)remote_base;
+        args[1] = (long)map_size;
+        remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
+        free(phdr);
+        close(fd);
+        return false;
+      }
+      continue;
+    }
 
     uintptr_t seg_start = (uintptr_t)phdr[i].p_vaddr + load_bias;
     uintptr_t seg_page = page_start(seg_start, page_size);
@@ -857,133 +837,21 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     uintptr_t seg_page_end = page_end(seg_end, page_size);
     size_t seg_page_len = (size_t)(seg_page_end - seg_page);
 
-    bool is_writable = (phdr[i].p_flags & PF_W) != 0;
-
-    if (is_writable) {
-      off_t seg_offset = (off_t)phdr[i].p_offset;
-      off_t file_page_offset = (off_t)page_start((uintptr_t)seg_offset, page_size);
-      uintptr_t file_end = (uintptr_t)phdr[i].p_vaddr + (uintptr_t)phdr[i].p_filesz + load_bias;
-      uintptr_t file_page_end = page_end(file_end, page_size);
-
-      if (phdr[i].p_filesz > 0) {
-
-        size_t file_map_len = (size_t)(file_page_end - seg_page);
-        args[0] = (long)seg_page;
-        args[1] = (long)file_map_len;
-        args[2] = PROT_READ | PROT_WRITE;
-        args[3] = MAP_FIXED | MAP_PRIVATE;
-        args[4] = remote_fd;
-        args[5] = remote_mmap_offset_arg(file_page_offset, page_size);
-
-        uintptr_t seg_map = (uintptr_t)remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
-        if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) {
-          LOGE("remote mmap writable file-backed segment failed for phdr %d", i);
-
-
-          args[0] = remote_fd;
-
-          remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-          free(phdr);
-          close(fd);
-
-          return false;
-        }
-
-        /* INFO: Zero-fill the tail of the last page (p_memsz - p_filesz within page). */
-        if (file_page_end > file_end) {
-          size_t tail_len = (size_t)(file_page_end - file_end);
-          char *zeros = (char *)calloc(1, tail_len);
-          if (!zeros || write_proc(pid, file_end, zeros, tail_len) != (ssize_t)tail_len) {
-            LOGE("Failed to zero tail for phdr %d", i);
-
-            if (zeros) free(zeros);
-            free(phdr);
-            close(fd);
-
-            return false;
-          }
-
-          free(zeros);
-        }
-      }
-
-      if (seg_page_end > file_page_end) {
-
-        args[0] = (long)file_page_end;
-        args[1] = (long)(seg_page_end - file_page_end);
-        args[2] = PROT_READ | PROT_WRITE;
-        args[3] = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
-        args[4] = -1;
-        args[5] = 0;
-
-        uintptr_t bss_map = (uintptr_t)remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
-        if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) {
-          LOGE("remote mmap bss segment failed for phdr %d", i);
-
-
-          args[0] = remote_fd;
-
-          remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-          free(phdr);
-          close(fd);
-
-          return false;
-        }
-      }
-    } else {
-      off_t seg_offset = (off_t)phdr[i].p_offset;
-      off_t file_page_offset = (off_t)page_start((uintptr_t)seg_offset, page_size);
-      uintptr_t file_end = (uintptr_t)phdr[i].p_vaddr + (uintptr_t)phdr[i].p_filesz + load_bias;
-      uintptr_t file_page_end = page_end(file_end, page_size);
-
-      if (phdr[i].p_filesz > 0) {
-
-        size_t file_map_len = (size_t)(file_page_end - seg_page);
-        args[0] = (long)seg_page;
-        args[1] = (long)file_map_len;
-        args[2] = PROT_READ | PROT_WRITE;
-        args[3] = MAP_FIXED | MAP_PRIVATE;
-        args[4] = remote_fd;
-        args[5] = remote_mmap_offset_arg(file_page_offset, page_size);
-
-        uintptr_t seg_map = (uintptr_t)remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
-        if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) {
-          LOGE("remote mmap file-backed segment failed for phdr %d", i);
-
-
-          args[0] = remote_fd;
-
-          remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-          free(phdr);
-          close(fd);
-
-          return false;
-        }
-      }
-
-      if (seg_page_end > file_page_end) {
-
-        args[0] = (long)file_page_end;
-        args[1] = (long)(seg_page_end - file_page_end);
-        args[2] = PROT_READ | PROT_WRITE;
-        args[3] = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
-        args[4] = -1;
-        args[5] = 0;
-
-        uintptr_t bss_map = (uintptr_t)remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
-        if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) {
-          LOGE("remote mmap bss segment failed for phdr %d", i);
-
-
-          args[0] = remote_fd;
-
-          remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
-          free(phdr);
-          close(fd);
-
-          return false;
-        }
-      }
+    args[0] = (long)seg_page;
+    args[1] = (long)seg_page_len;
+    args[2] = PROT_READ | PROT_WRITE;
+    args[3] = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    args[4] = -1;
+    args[5] = 0;
+    long seg_map_result = remote_syscall(pid, regs, syscall_gadget, SYS_mmap, args, 6);
+    if ((uintptr_t)seg_map_result != seg_page) {
+      LOGE("remote anonymous PT_LOAD mapping failed for phdr %d: %ld", i, seg_map_result);
+      args[0] = (long)remote_base;
+      args[1] = (long)map_size;
+      remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
+      free(phdr);
+      close(fd);
+      return false;
     }
 
     /* INFO: Record segment info for later protection finalization */
@@ -993,23 +861,45 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
     if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
 
-    if (segs_count < (sizeof(segs) / sizeof(segs[0]))) {
-      segs[segs_count].addr = seg_page;
-      segs[segs_count].len = seg_page_len;
-      segs[segs_count].final_prot = prot;
-      segs_count++;
+    if (segs_count >= (sizeof(segs) / sizeof(segs[0]))) {
+      LOGE("Too many PT_LOAD segments");
+      args[0] = (long)remote_base;
+      args[1] = (long)map_size;
+      remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
+      free(phdr);
+      close(fd);
+      return false;
     }
+    segs[segs_count].addr = seg_page;
+    segs[segs_count].len = seg_page_len;
+    segs[segs_count].final_prot = prot;
+    segs_count++;
   }
 
-
-  args[0] = remote_fd;
-
-  remote_syscall(pid, regs, syscall_gadget, SYS_close, args, 1);
+  /* Copy exact file bytes after all overlapping segment pages have been
+     established.  Anonymous mmap already supplies zero-filled BSS/tails. */
+  for (int i = 0; i < eh.e_phnum; i++) {
+    if (phdr[i].p_type != PT_LOAD || phdr[i].p_filesz == 0) continue;
+    uintptr_t destination = (uintptr_t)phdr[i].p_vaddr + load_bias;
+    if (!copy_file_region_to_remote(pid, fd, (off_t)phdr[i].p_offset,
+                                    destination, (size_t)phdr[i].p_filesz)) {
+      LOGE("Failed to copy PT_LOAD payload for phdr %d", i);
+      args[0] = (long)remote_base;
+      args[1] = (long)map_size;
+      remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
+      free(phdr);
+      close(fd);
+      return false;
+    }
+  }
 
   struct elf_dyn_info dinfo;
   if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) {
     LOGE("Failed to load ELF dynamic info");
 
+    args[0] = (long)remote_base;
+    args[1] = (long)map_size;
+    remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
     free(phdr);
     close(fd);
 
@@ -1022,6 +912,9 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     if (!needed_paths) {
       LOGE("Failed to allocate memory for needed paths");
 
+      args[0] = (long)remote_base;
+      args[1] = (long)map_size;
+      remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
       elf_dyn_info_destroy(&dinfo);
       free(phdr);
       close(fd);
@@ -1043,6 +936,9 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
   if (!apply_relocations(pid, fd, &dinfo, local_map, remote_map, needed_paths, load_bias)) {
     LOGE("Failed to apply relocations");
 
+    args[0] = (long)remote_base;
+    args[1] = (long)map_size;
+    remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
     free((void *)needed_paths);
     elf_dyn_info_destroy(&dinfo);
     free(phdr);
@@ -1081,6 +977,9 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
   if (!find_dynsym_value(fd, &dinfo, "entry", &entry_value)) {
     LOGE("Failed to resolve entry from ELF dynsym");
 
+    args[0] = (long)remote_base;
+    args[1] = (long)map_size;
+    remote_syscall(pid, regs, syscall_gadget, SYS_munmap, args, 2);
     free((void *)needed_paths);
     elf_dyn_info_destroy(&dinfo);
     free(phdr);
