@@ -1236,8 +1236,12 @@ static bool domainless_target_is_current_and_live(pid_t pid, bool is_64bit) {
   fclose(stat_file);
   if (!live) return false;
 
-  /* The init debug PID property is the authoritative service generation. A
-     live but superseded PID must not keep the UI green after Zygote restart. */
+  /* A positive init debug PID is authoritative when the OEM publishes one.
+     Some builds leave init.svc_debug_pid.* empty even while the service is
+     running. Absence is not evidence that a still-live remembered Zygote was
+     replaced: treating it as such drops the one-shot target immediately and
+     leaves a permanent false "reboot required" warning. */
+  bool authoritative_pid_available = false;
   for (size_t i = 0; i < domainless_service_count; i++) {
     if (domainless_services[i].is_64bit != is_64bit) continue;
     char value[PROP_VALUE_MAX] = { 0 };
@@ -1246,9 +1250,15 @@ static bool domainless_target_is_current_and_live(pid_t pid, bool is_64bit) {
     char *end = NULL;
     errno = 0;
     long parsed = strtol(value, &end, 10);
-    if (errno == 0 && end != value && *end == '\0' && parsed == pid) return true;
+    if (errno != 0 || end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX)
+      continue;
+    authoritative_pid_available = true;
+    if ((pid_t)parsed == pid) return true;
   }
-  return false;
+
+  /* A different published positive PID proves replacement. Otherwise /proc
+     liveness remains the best available generation signal on this OEM. */
+  return !authoritative_pid_available;
 }
 
 static void domainless_forget_dead_targets() {
