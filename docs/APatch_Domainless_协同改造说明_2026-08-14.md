@@ -765,3 +765,28 @@ fail-closed 丢弃，不再进入 `read_loop()`。新环境信息全部解析成
 基线。ADB 序列号显示 `unknown` 来自 CkbSmartN 的属性隐藏行为，不等于 ADB 断连。验证顺序必须是：
 先用 i18 + CkbSmartN、保持 Assistant 禁用完成冷启动和状态验收；确认日志洪泛消失、双 daemon 变绿后，
 再单独恢复 Assistant 做第二次重启和 Hunter 排除复验。
+
+### 9.24 i18 + CkbSmartN 真机通过
+
+用户仅覆盖安装 i18，保持 CkbSmartN 启用、Zygisk Assistant 禁用后完成完整重启。真机 boot ID 为
+`4ca4f465-5fe6-4518-bb48-3ba318367a56`；启动约 5 分钟后的证据为：
+
+- `sys.boot_completed=1`，SELinux Enforcing；活动 `module.prop` 为
+  `v1.0.0-i18 (555-7519396-release)`；
+- `state.json` 中 daemon64/32 与 Zygote64/32 全部为 1，两个 ABI 的模块列表都只包含
+  `zygisk_ckbsmart`；Assistant 的 `disable` 文件存在；
+- Zygote64/32 PID 715/716、Monitor PID 797、zygiskd64/32 PID 799/800、system_server PID 2157、
+  `lspd` PID 1374 均持续存活；CkbSmartN 双 ABI companion 已建立；
+- 本次启动全量 logcat 中 `Got EAGAIN while reading`、非法/短 Monitor packet 和发送失败全部为 0；
+  稳定期再次检查最近 4000 行仍全部为 0；
+- 5 秒 `/proc/<pid>/stat` 采样中 Monitor 仅增加 3 个 CPU tick、logd 仅增加 2 个，i17 忙循环和日志
+  洪泛已经消失；
+- `serial` Binder 服务存在；多个 64 位 app child 均记录 fallback 模块真实卸载成功。
+
+crash buffer 中的非 PID 1 `init` 子进程 SIGABRT 是同机 MIUI 成功/失败启动都会出现的已知基线噪声，
+APatch 台账 SV2-085 已有禁用 IRezygisk 的对照；本轮不能据此否定稳定状态。ADB 仍以 `unknown` 为序列号，
+但 transport 为 `device` 且命令正常，这是 CkbSmartN 属性隐藏结果。
+
+因此 i18 的 Monitor 原子数据报修复以及 i17 的 namespace/unload 改造在 **IRezygisk + CkbSmartN** 组合上
+完成真机验收。该结论不包含 Assistant；下一步只能单独启用 Assistant 后再完整重启，复验双 ABI 状态、
+EAGAIN、Hunter mountinfo/maps 和目标崩溃，禁止同时改变其他模块。
