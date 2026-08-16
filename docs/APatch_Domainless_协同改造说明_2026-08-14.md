@@ -790,3 +790,31 @@ APatch 台账 SV2-085 已有禁用 IRezygisk 的对照；本轮不能据此否�
 因此 i18 的 Monitor 原子数据报修复以及 i17 的 namespace/unload 改造在 **IRezygisk + CkbSmartN** 组合上
 完成真机验收。该结论不包含 Assistant；下一步只能单独启用 Assistant 后再完整重启，复验双 ABI 状态、
 EAGAIN、Hunter mountinfo/maps 和目标崩溃，禁止同时改变其他模块。
+
+### 9.25 三模块复验暴露缺失 debug PID 的假重启与 i19 修复
+
+恢复 Zygisk Assistant 后完成完整重启，boot ID 为
+`68bb9a4f-aded-4fb7-85e2-5d77d6d549c8`。IRezygisk i18、Zygisk Assistant
+`v2.1.5-apatch1 (5ec463e-release)` 和 CkbSmartN `v0.101.17 (5484)` 均启用；
+`sys.boot_completed=1`、SELinux Enforcing，`state.json` 的 daemon64/32 与 Zygote64/32 全部为 1，两个
+ABI 的模块列表都同时包含 `zygisk-assistant` 和 `zygisk_ckbsmart`。全量日志中 Monitor EAGAIN、非法/短
+数据报、daemon 发送失败以及 namespace FD 接收/切换错误均为 0，说明 Assistant 没有重新触发 i17/i18
+已修复的两类协议问题。
+
+模块卡片仍出现 `Injected Zygote restarted ... reboot required`，但这次不是 Zygote 真重启。64/32 位
+Zygote PID 716/717 从启动后持续存活，`init.svc.zygote` 与 `init.svc.zygote_secondary` 均为 `running`；
+与此同时，本机两个 `init.svc_debug_pid.*` 属性始终为空。i18 的
+`domainless_target_is_current_and_live()` 在 `/proc/<pid>/stat` 已确认目标存活后，仍要求至少一个同 ABI
+debug PID 属性精确等于目标 PID；属性缺失会直接返回 false，清掉一次性 target 并写入永久警告。稍后到达
+的 `ZYGOTE*_INJECTED` 数据报又把绿色状态恢复为 1，于是形成“状态全绿但仍显示重启警告”的矛盾。
+
+i19/556 按可证明证据修复这一通用状态机：
+
+1. `/proc/<pid>/stat` 不存在或处于 zombie/dead 状态时仍判定目标已丢失；
+2. OEM 发布有效正数 debug PID 时仍将其视为权威 generation；若它与记忆 PID 不同，则判定已替换；
+3. 属性为空、暂未发布、非数字或非正数时不再作为重启证据，继续使用已确认的 `/proc` 存活结果；
+4. 不按 Assistant、CkbSmartN、机型、固定 PID 或延时特判，真实 Zygote 死亡及明确新 PID 的检测语义不变。
+
+源码提交为 `3694e3c`。本节当前只能确认 i18 三模块运行面正常并定位 UI/target bookkeeping 缺陷；i19
+完成四 ABI Release 与包审计后仍需覆盖刷入、完整重启，确认警告不再产生且三模块状态保持全绿，才能把
+i19 标记为真机通过。

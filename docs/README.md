@@ -9,7 +9,10 @@
 - [`APatch_Domainless_协同改造说明_2026-08-14.md`](./APatch_Domainless_协同改造说明_2026-08-14.md)：
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
-当前真机底座为 `v1.0.0-i15` / 552，当前未提交插件兼容候选为 `v1.0.0-i16` / 553；domainless 配套最低版本 APatch 19076，并要求 boot 中实际运行
+当前已通过的双模块底座为 `v1.0.0-i18` / 555（IRezygisk + CkbSmartN）；三模块复验确认注入、daemon、
+Assistant 清理和 CkbSmartN companion 均正常，但暴露 MIUI 不发布 `init.svc_debug_pid.*` 时的假重启状态
+误报。`v1.0.0-i19` / 556 已在源码提交 `3694e3c` 修复，当前仍是待刷入真机候选。domainless 配套最低
+版本 APatch 19076，并要求 boot 中实际运行
 KernelPatch 0.13.12/d12。i10/d11 真机已证伪：目标完成 self-claim 后，stack-backed task_ext授权在OEM exec
 AVC边界仍未命中；精确原厂kernel反汇编已排除state9 ABI、flags/class/permission错误。i11沿用既有
 tracer/ABI handoff，只把安装门禁提升到d12 claimed-permit协议。`i1` 暴露
