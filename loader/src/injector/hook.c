@@ -190,30 +190,27 @@ static void jni_hook_list_add(const char *class_name, JNINativeMethod *methods, 
 }
 
 static bool update_mnt_ns(enum mount_namespace_state mns_state, bool dry_run) {
-  char ns_path[PATH_MAX];
-  if (!rezygiskd_update_mns(mns_state, ns_path, sizeof(ns_path))) {
+  int updated_ns = rezygiskd_update_mns(mns_state);
+  if (updated_ns == -1) {
     PLOGE("Failed to update mount namespace");
 
     return false;
   }
 
-  if (dry_run) return true;
+  if (dry_run) {
+    close(updated_ns);
 
-  int updated_ns = open(ns_path, O_RDONLY);
-  if (updated_ns == -1) {
-    PLOGE("Failed to open mount namespace [%s]", ns_path);
-
-    return false;
+    return true;
   }
 
   char *mns_state_str = "unknown";
   if (mns_state == Clean) mns_state_str = "clean";
   if (mns_state == Mounted) mns_state_str = "mounted";
 
-  LOGD("set mount namespace to [%s] fd=[%d]: %s", ns_path, updated_ns, mns_state_str);
+  LOGD("set mount namespace from received fd=[%d]: %s", updated_ns, mns_state_str);
 
   if (setns(updated_ns, CLONE_NEWNS) == -1) {
-    PLOGE("Failed to set mount namespace [%s]", ns_path);
+    PLOGE("Failed to set received mount namespace fd=[%d]", updated_ns);
 
     close(updated_ns);
 
@@ -1074,8 +1071,10 @@ static bool load_modules_only(void) {
       if (loaded_by_csoloader) {
         csoloader_unload(&module->lib);
       } else {
-        /* A constructor may already have hidden the library from Android's
-           solist. Retaining an inert mapping is safer than dlclose(handle). */
+        dlerror();
+        if (dlclose(module->android_linker_handle) != 0)
+          LOGE("Failed to unload fallback module without an entry point [%s]: %s",
+               lib_path, dlerror());
         free(module->android_linker_path);
       }
       memset(module, 0, sizeof(*module));
@@ -1135,15 +1134,26 @@ static void rz_run_modules_post(struct zygisk_context *ctx) {
     }
 
     if (m->android_linker_handle) {
-      /* DLCLOSE_MODULE_LIBRARY is a hint. A fallback module can already have
-         removed itself from Android's solist, so dlclose(handle) is unsafe.
-         Leave the mapping in this short-lived child and count the logical
-         unload after ReZygisk drops all callbacks during rz_cleanup(). */
-      LOGD("Retaining Android-linker fallback module after unload request: %s",
-           rz_module_name(m));
+      /* The module explicitly opted into the standard Zygisk unload contract,
+         and its post-specialize callback has returned. Android's linker owns
+         this handle, so it must also own the physical unmap. Keeping only a
+         logical unload leaves file-backed VMAs visible in every target child. */
+      const char *module_path = rz_module_name(m);
+      dlerror();
+      int unload_result = dlclose(m->android_linker_handle);
+      const char *unload_error = unload_result == 0 ? NULL : dlerror();
+
+      if (unload_result == 0) {
+        LOGI("Unloaded Android-linker fallback module: %s", module_path);
+        m->android_linker_handle = NULL;
+        modules_unloaded++;
+      } else {
+        LOGE("Failed to unload Android-linker fallback module [%s]: %s",
+             module_path, unload_error ? unload_error : "unknown linker error");
+      }
+
       free(m->android_linker_path);
       m->android_linker_path = NULL;
-      modules_unloaded++;
       continue;
     }
 

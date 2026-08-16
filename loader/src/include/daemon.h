@@ -73,7 +73,7 @@ int rezygiskd_get_module_dir(size_t index);
 
 void rezygiskd_zygote_restart();
 
-bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_t buf_size);
+int rezygiskd_update_mns(enum mount_namespace_state nms_state);
 
 bool rezygiskd_remove_module(size_t index);
 

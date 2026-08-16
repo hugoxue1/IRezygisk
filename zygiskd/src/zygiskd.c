@@ -663,10 +663,6 @@ void zygiskd_start(char *restrict argv[]) {
         ret = read_uint8_t(client_fd, &mns_state);
         ASSURE_SIZE_READ("UpdateMountNamespace", "mns_state", ret, sizeof(mns_state), break);
 
-        uint32_t our_pid = (uint32_t)getpid();
-        ret = write_uint32_t(client_fd, our_pid);
-        ASSURE_SIZE_WRITE("UpdateMountNamespace", "our_pid", ret, sizeof(our_pid), break);
-
         if ((enum MountNamespaceState)mns_state == Clean)
           save_mns_fd(pid, Mounted, impl);
 
@@ -674,14 +670,17 @@ void zygiskd_start(char *restrict argv[]) {
         if (ns_fd == -1) {
           LOGE("Failed to save mount namespace fd for pid %d: %s", pid, strerror(errno));
 
-          ret = write_uint32_t(client_fd, (uint32_t)0);
-          ASSURE_SIZE_WRITE("UpdateMountNamespace", "ns_fd", ret, sizeof(ns_fd), break);
+          ret = write_uint8_t(client_fd, 0);
+          ASSURE_SIZE_WRITE("UpdateMountNamespace", "result", ret, sizeof(uint8_t), break);
 
           break;
         }
 
-        ret = write_uint32_t(client_fd, (uint32_t)ns_fd);
-        ASSURE_SIZE_WRITE("UpdateMountNamespace", "ns_fd", ret, sizeof(ns_fd), break);
+        ret = write_uint8_t(client_fd, 1);
+        ASSURE_SIZE_WRITE("UpdateMountNamespace", "result", ret, sizeof(uint8_t), break);
+
+        if (write_fd(client_fd, ns_fd) == -1)
+          LOGE("Failed sending mount namespace fd for pid %d: %s", pid, strerror(errno));
 
         break;
       }

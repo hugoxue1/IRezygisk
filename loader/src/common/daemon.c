@@ -490,33 +490,32 @@ void rezygiskd_zygote_restart() {
   rezygiskd_disconnect(fd);
 }
 
-bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_t buf_size) {
+int rezygiskd_update_mns(enum mount_namespace_state nms_state) {
   int fd = rezygiskd_connect(1);
-  if (fd == -1) return false;
+  if (fd == -1) return -1;
 
-  safe_write(write_uint8_t(fd, (uint8_t)UpdateMountNamespace), "UpdateMountNamespace action", return false);
-  safe_write(write_uint32_t(fd, (uint32_t)getpid()), "pid", return false);
-  safe_write(write_uint8_t(fd, (uint8_t)nms_state), "mount namespace state", return false);
+  safe_write(write_uint8_t(fd, (uint8_t)UpdateMountNamespace), "UpdateMountNamespace action", return -1);
+  safe_write(write_uint32_t(fd, (uint32_t)getpid()), "pid", return -1);
+  safe_write(write_uint8_t(fd, (uint8_t)nms_state), "mount namespace state", return -1);
 
-  uint32_t target_pid = 0;
-  safe_read(read_uint32_t(fd, &target_pid), "target pid", return false);
-
-  uint32_t target_fd = 0;
-  safe_read(read_uint32_t(fd, &target_fd), "target fd", return false);
-
-  if (target_fd == 0) {
-    LOGE("Failed to get target fd");
+  uint8_t available = 0;
+  safe_read(read_uint8_t(fd, &available), "mount namespace result", return -1);
+  if (available != 1) {
+    LOGE("ReZygiskd failed to prepare the requested mount namespace");
 
     rezygiskd_disconnect(fd);
 
-    return false;
+    return -1;
   }
 
-  snprintf(buf, buf_size, "/proc/%u/fd/%u", target_pid, target_fd);
+  /* Passing the namespace descriptor directly avoids asking a post-fork
+     Zygote child to traverse /proc/<zygiskd>/fd. SELinux can deny that path
+     even though the already-authorized daemon connection remains usable. */
+  int namespace_fd = read_fd(fd);
 
   rezygiskd_disconnect(fd);
 
-  return true;
+  return namespace_fd;
 }
 
 bool rezygiskd_remove_module(size_t index) {

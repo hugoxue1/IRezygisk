@@ -695,3 +695,43 @@ SHA-256 `C8C3093F639C6FC862DBBD1DC843B7BE81BD424200324EA886D30C943A104792`。其
 用完全相同的 FD + `android_dlopen_ext` 路径 0.333 秒加载成功，`zygisk_module_entry` 与
 `zygisk_companion_entry` 均非空。该证据仍不替代 i16 重启后的 app/system_server 回调、Bridge、AVC 与
 tombstone 验收。
+
+### 9.22 i16 真机排除结果与下一版 fallback 卸载契约
+
+i16 与 Zygisk Assistant、CkbSmartN 同时启用后，`com.zhenxi.hunter` 已在 APatch Manager 中设置
+`exclude=1`。Hunter 主进程、app zygote、twin 和 isolated service 的 `mountinfo` 均不再包含模块目录或
+ART APEX 的 dex2oat bind mount，证明 package_config、namespace 分离及 Assistant companion 清理链
+有效。但四个进程的 VMA 仍同时保留 Assistant 和 CkbSmartN arm64 SO 的文件 backing，Hunter 因而报告
+`Mem Find Mark`。
+
+加载日志给出了共同条件：两个模块都先被 CSOLoader 拒绝，再由 i16 的
+`android_dlopen_ext(..., ANDROID_DLEXT_USE_LIBRARY_FD|ANDROID_DLEXT_FORCE_LOAD)` 回退加载。9.21 为规避
+可能失效的 handle，把 `DLCLOSE_MODULE_LIBRARY` 降级成了逻辑提示；真机结果证明该设计只能保证稳定
+加载，不能履行标准 Zygisk 的 child 侧卸载契约。APatch 排除与 solist 清理不会消除内核 VMA backing。
+
+下一版采用下列通用约束：
+
+1. 只有模块明确设置 `DLCLOSE_MODULE_LIBRARY` 才进入真实卸载；
+2. 必须等对应 post 回调完整返回后才调用 `dlclose()`，避免仍在模块栈内卸载；
+3. 检查 `dlclose()` 返回值，成功后清空 handle；失败时记录模块和 linker 错误并保持可诊断状态；
+4. 不按包名、模块名、PID、ABI 或 Hunter 写分支；主 CSOLoader 路径保持原有行为；
+5. 完整重启后同时验证目标进程稳定、module callbacks、companion、mountinfo、maps/map_files 与 tombstone。
+
+同轮 core 还出现过打开 `/proc/<zygiskd>/fd/<mount-ns-fd>` 的 EACCES；Assistant companion 随后补救成功。
+这说明 namespace 清理的最终效果已达成，但 core 的 namespace FD 交付仍需单独修复/验证，不能用最终
+mountinfo 干净倒推所有中间路径都成功。
+
+SELinux 检测页面同时给出 `decision=CLEAN`、`product=NONE`，但列出 `SYSTEM_SERVER_EXECMEM` 等启发式
+风险码。该策略来自 CkbSmartN/LSPlant 的真实功能前提，属于系统全局 policy；ReZygisk/Assistant 的应用
+排除无法隐藏，且禁止通过伪造 SELinuxFS 或修改检测器处理。
+
+i17/554 已实现上述契约：`UpdateMountNamespace` 响应改成“状态字节 + SCM_RIGHTS namespace FD”，child
+直接对收到的 FD 执行 `setns()`；fallback 模块的 post 回调返回后，显式 opt-in 才执行 `dlclose()`，并把
+真实结果写入 Release 可见日志。无入口点的 fallback handle 也会立即关闭，不再遗留无用映射。实现没有
+模块名、应用名、PID 或 ABI 特判。
+
+四 ABI Release 构建成功；最终本地提交后必须重新构建
+`build/out/IRezygisk-v1.0.0-i17-554-<commit>-release.zip`，避免包内版本仍指向修改前提交。ZIP 的 232 个
+entries 和 99 组 payload/sidecar 是发布门禁；最终文件名、大小与 SHA-256 统一记录在工作区交接 102，
+不在本仓库提交内形成“包哈希依赖提交、提交又依赖包哈希”的循环。当前设备未连接，本节结论仅到
+“构建候选”；完整重启前不得把 namespace EACCES 消失或 Hunter VMA 清零写成已通过。
