@@ -818,3 +818,19 @@ i19/556 按可证明证据修复这一通用状态机：
 源码提交为 `3694e3c`。本节当前只能确认 i18 三模块运行面正常并定位 UI/target bookkeeping 缺陷；i19
 完成四 ABI Release 与包审计后仍需覆盖刷入、完整重启，确认警告不再产生且三模块状态保持全绿，才能把
 i19 标记为真机通过。
+
+## 9.26 i20：标准模块加载与回调的顶层授权窗口
+
+i19 只修正缺失 `init.svc_debug_pid.*` 时的状态误报；它不解决 CkbSmartN 为 LSPlant/Dobby 写入全局
+`system_server execmem` 后产生的策略检测。i20/557 与 APatch 19081、KernelPatch d13 成套引入通用
+task-local 窗口，不按模块名或 hook 引擎定制。
+
+domainless Zygote 注入成功后，loader 用 0x1126 把 d13 已消费的 exec marker 激活为 non-authorizing
+carrier。`hook_unloader()` 在模块 DSO 重定位和构造函数前 begin、结束后 end 并恢复 carrier。Zygote
+child 的 `rz_run_modules_pre/post()` 各使用一次私有预算；pre 结束恢复，post 结束永久撤销。任一 begin
+失败就跳过模块代码；已打开的 FULL 窗口若无法 end，进程 `_exit(127)`，不能带权限继续进入应用代码。
+
+Magisk/KernelSU 及非 domainless 路径的 helper 为 no-op，保持现有行为。d13 feature bit 或 APatch
+版本不匹配时，APD/IRezygisk 门禁拒绝 provider，不允许把 19076/d12 与 i20 静默混装。当前四 ABI loader
+Release 已编译通过，但最终包必须在 i20 源码 commit 后 clean rebuild，并完成目标机冷启动后才能写真机
+通过。

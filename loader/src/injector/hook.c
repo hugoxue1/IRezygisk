@@ -22,6 +22,7 @@
 #include "daemon.h"
 #include "misc.h"
 #include "module.h"
+#include "apatch_task_auth.h"
 
 #include "art_method.h"
 #include "cpp_strings.h"
@@ -38,6 +39,7 @@ enum {
   SERVER_FORK_AND_SPECIALIZE,
   DO_REVERT_UNMOUNT,
   SKIP_FD_SANITIZATION,
+  MODULES_PREPARED,
 
   FLAG_MAX
 };
@@ -1100,16 +1102,40 @@ static bool load_modules_only(void) {
 }
 
 static void rz_run_modules_pre(struct zygisk_context *ctx) {
+  if (!apatch_task_auth_begin_callback()) {
+    LOGE("Skipping module pre-specialize callbacks: APatch task-local authorization unavailable");
+    return;
+  }
+
   for (size_t i = 0; i < zygisk_module_length; i++) {
     rz_module_call_on_load(&zygisk_modules[i], ctx->env);
 
     if (FLAG_GET(ctx, APP_SPECIALIZE)) rz_module_call_pre_app_specialize(&zygisk_modules[i], ctx->args.app);
     else if (FLAG_GET(ctx, SERVER_FORK_AND_SPECIALIZE)) rz_module_call_pre_server_specialize(&zygisk_modules[i], ctx->args.server);
   }
+
+  if (!apatch_task_auth_end_callback(true)) {
+    LOGE("APatch failed to close the pre-specialize authorization window");
+    _exit(127);
+  }
+  FLAG_SET(ctx, MODULES_PREPARED);
 }
 
 static void rz_run_modules_post(struct zygisk_context *ctx) {
   FLAG_SET(ctx, POST_SPECIALIZE);
+
+  if (!FLAG_GET(ctx, MODULES_PREPARED)) {
+    if (apatch_task_auth_enabled() && !apatch_task_auth_end_callback(false)) {
+      LOGE("APatch failed to discard an unused child-callback carrier");
+      _exit(127);
+    }
+    return;
+  }
+  if (!apatch_task_auth_begin_callback()) {
+    LOGE("Skipping module post-specialize callbacks: APatch task-local authorization unavailable");
+    if (!apatch_task_auth_end_callback(false)) _exit(127);
+    return;
+  }
 
   size_t modules_unloaded = 0;
   for (size_t i = 0; i < zygisk_module_length; i++) {
@@ -1168,6 +1194,11 @@ static void rz_run_modules_post(struct zygisk_context *ctx) {
 
   if (zygisk_module_length > 0)
     LOGD("Modules unloaded: %zu/%zu", modules_unloaded, zygisk_module_length);
+
+  if (!apatch_task_auth_end_callback(false)) {
+    LOGE("APatch failed to revoke the post-specialize authorization window");
+    _exit(127);
+  }
 }
 
 static void rz_app_specialize_pre(struct zygisk_context *ctx) {
@@ -1497,9 +1528,17 @@ static void hook_unloader(void) {
 
   PLT_HOOK_UNREGISTER("libandroid_runtime.so", property_get, false);
 
-  /* INFO: Load modules early on (before system server fork) to spread through all Zygotes */
-  if (!load_modules_only()) {
+  /* Load modules once in Zygote so all children inherit the mappings. APatch's
+     parent carrier opens a one-use task-local window for module relocations
+     and constructors; the restored carrier itself cannot authorize access. */
+  if (!apatch_task_auth_begin_callback()) {
+    LOGE("Skipping Zygisk module load: APatch task-local authorization unavailable");
+  } else if (!load_modules_only()) {
     LOGE("Failed to load modules in hook_unloader");
+  }
+  if (!apatch_task_auth_end_callback(true)) {
+    LOGE("APatch failed to close the Zygisk module-load authorization window");
+    _exit(127);
   }
 
   LOGD("ReZygisk unloader hooked successfully");
