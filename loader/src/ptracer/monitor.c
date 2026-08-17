@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -850,6 +851,27 @@ void sigchld_listener_stop() {
 static char pre_section[1024];
 static char post_section[1024];
 
+static bool append_prop_section(char *section, size_t capacity,
+                                const char *text) {
+  size_t used = strnlen(section, capacity);
+  size_t added = strlen(text);
+  if (used >= capacity || added >= capacity - used) {
+    LOGE("module.prop section exceeds %zu bytes", capacity - 1);
+    return false;
+  }
+  memcpy(section + used, text, added + 1);
+  return true;
+}
+
+static char *skip_previous_status_prefixes(char *description) {
+  while (description[0] == '[') {
+    char *end = strstr(description, "] ");
+    if (end == NULL) break;
+    description = end + 2;
+  }
+  return description;
+}
+
 #define WRITE_STATUS_ABI(suffix)                                                     \
   if (status ## suffix.supported) {                                                  \
     strcat(status_text, ", ReZygisk " # suffix "-bit: ");                            \
@@ -1003,25 +1025,42 @@ static bool prepare_environment() {
     return false;
   }
 
+  pre_section[0] = '\0';
+  post_section[0] = '\0';
   bool after_description = false;
+  bool description_found = false;
+  bool valid = true;
+  char *line = NULL;
+  size_t line_capacity = 0;
 
-  char line[1024];
-  while (fgets(line, sizeof(line), orig_prop) != NULL) {
+  while (getline(&line, &line_capacity, orig_prop) != -1) {
     if (strncmp(line, "description=", strlen("description=")) == 0) {
-      strcat(pre_section, "description=");
-      strcat(post_section, line + strlen("description="));
+      char *description = line + strlen("description=");
+      description = skip_previous_status_prefixes(description);
+      valid = append_prop_section(pre_section, sizeof(pre_section),
+                                  "description=") &&
+              append_prop_section(post_section, sizeof(post_section),
+                                  description);
+      description_found = true;
       after_description = true;
-
+      if (!valid) break;
       continue;
     }
 
-    if (after_description) strcat(post_section, line);
-    else strcat(pre_section, line);
+    valid = after_description ?
+              append_prop_section(post_section, sizeof(post_section), line) :
+              append_prop_section(pre_section, sizeof(pre_section), line);
+    if (!valid) break;
   }
 
+  free(line);
   fclose(orig_prop);
 
-  return true;
+  if (!description_found) {
+    LOGE("module.prop has no description field");
+    return false;
+  }
+  return valid;
 }
 
 #define DOMAINLESS_BROKER_FD_ENV "APATCH_EARLY_LOADER_FD"

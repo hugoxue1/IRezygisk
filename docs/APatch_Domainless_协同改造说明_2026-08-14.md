@@ -834,3 +834,23 @@ Magisk/KernelSU 及非 domainless 路径的 helper 为 no-op，保持现有行�
 版本不匹配时，APD/IRezygisk 门禁拒绝 provider，不允许把 19076/d12 与 i20 静默混装。当前四 ABI loader
 Release 已编译通过，但最终包必须在 i20 源码 commit 后 clean rebuild，并完成目标机冷启动后才能写真机
 通过。
+
+## 9.27 i21：module.prop 状态重写必须有界且幂等
+
+19090 失败启动时出现的新 tombstone 与 APatch V7 是两条独立问题。`zygisk-ptrace64` 以 SIGABRT 退出，
+FORTIFY 明确报告 `strcat` 写过 0 字节剩余缓冲区；活动 `module.prop` 的 description 前已经累积 12 个
+`[Injected Zygote restarted ...]` 前缀。旧 Monitor 每次启动把新状态追加到旧 description，又用两个
+1024 字节静态 section 和无界 `strcat` 重建文件，因此重复启动最终必然越界，并由安装器/健康检查创建
+`disable`，表现为 IRezygisk 突然不工作。
+
+i21/558 只修 IRezygisk 自己的状态文件实现，不承担 Assistant 或 CkbSmartN 兼容：
+
+1. 用 `getline` 读取完整 `module.prop` 行，避免 1024 字节行缓冲截断；
+2. 解析 description 时移除已有的 Monitor 状态前缀，新状态采用替换而不是累加；
+3. 每次准备环境先清空 section，所有拼接统一检查剩余容量，超限记录错误并安全退出；
+4. description 缺失时拒绝覆盖原文件，不用半截内容继续运行；
+5. 新增 4 项回归契约，覆盖幂等替换、动态整行读取、全部有界拼接和版本单调性。
+
+四 ABI Release 已完成编译与链接。最终 ZIP 必须从包含本节和源码修复的提交 clean rebuild；真机验收需
+确认 `disable` 不再产生、description 始终只有一个状态前缀、无新增 `zygisk-ptrace` tombstone，并与
+APatch 19091/d20 的通用脚本 V7 分开判定。
