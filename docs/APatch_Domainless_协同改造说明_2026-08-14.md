@@ -4,10 +4,11 @@
 
 上游基线：ReZygisk `e42886f`（v1.0.0 / versionCode 537）
 
-当前已验收底座：APatch 19076 + KernelPatch 0.13.12/d12 + IRezygisk `v1.0.0-i15`/552。i15 已完成
-32/64 位真机注入、匿名 maps、Zygote 标签控制 FD 与 boot-health 验收；最低 domainless APatch 仍为
-19076，APatch/KernelPatch 协议不再变化。ckbsmart v0.101.17/5484 的 arm64 SO 和 `lspd` Binder/SELinux
-问题属于后续插件兼容，不得把它回写成 IRezygisk 未通过。
+当前最终真机基线：APatch 19096/3215d2a + KernelPatch 0.13.23/d23 + IRezygisk
+`v1.0.0-i21`/558/`ba2e29b` + CkbSmartN 0.101.20 + Zygisk Assistant 2.1.5-apatch1。i21 已完成
+32/64 位注入、原子状态数据报、缺失 debug PID 容错、幂等有界 `module.prop` 状态重写以及三模块共存
+回归。i15–i20 是问题收敛历史，不再作为交付基线；CkbSmartN 长期 daemon/Binder 与 Assistant
+denylist 清理仍按各自业务边界验收，不能回写成 IRezygisk 通用加载失败。
 
 目标远程：`git@github.com:hugoxue1/IRezygisk.git`
 
@@ -854,3 +855,25 @@ i21/558 只修 IRezygisk 自己的状态文件实现，不承担 Assistant 或 C
 四 ABI Release 已完成编译与链接。最终 ZIP 必须从包含本节和源码修复的提交 clean rebuild；真机验收需
 确认 `disable` 不再产生、description 始终只有一个状态前缀、无新增 `zygisk-ptrace` tombstone，并与
 APatch 19091/d20 的通用脚本 V7 分开判定。
+
+## 9.28 i21 最终真机验收与未来模块边界
+
+i21/558/`ba2e29b` 已先在 APatch 19092/d20 的单模块启动中完成真机验收：Monitor、64/32 位 daemon 与
+Zygote 状态全绿，`description` 中 `Monitor:` 只有一个，旧重启前缀为 0，未产生新的
+`zygisk-ptrace` tombstone。之后升级到最终 APatch 19096/d23，并逐个恢复 CkbSmartN 0.101.20 和
+Assistant 2.1.5-apatch1；最终 boot 的两个 ABI 模块清单都同时包含 `zygisk_ckbsmart` 与
+`zygisk-assistant`，没有 Monitor EAGAIN、状态越界、目标 AVC 或新 tombstone。
+
+当前正式 IRezygisk 包为：
+
+```text
+IRezygisk-v1.0.0-i21-558-ba2e29b-release.zip
+size   = 615,554 bytes
+sha256 = B5F70E43CAE407412A40AF9CA6128731A4C4FF42960BC93C024857B2CD4442C8
+```
+
+这里的 IRezygisk 改造是通用 loader/runtime 适配，不是 CkbSmartN 或 Assistant 名称特判。以后符合标准
+Zygisk API 的模块默认不需要修改；只有模块依赖固定 Magisk domain、提交 live policy、启动长期特权
+daemon/系统 Binder 服务，或绕过标准 module/companion 生命周期时，才需要模块侧声明并适配自己的
+额外能力。统一判断矩阵见工作区
+`docs/工程项目总览/103_APatch_模块兼容责任边界与接入矩阵_2026-08-17.md`。
