@@ -63,6 +63,21 @@ class Android11To16LinkerContractTest(unittest.TestCase):
         self.assertIn("PTRACE_INTERRUPT", body)
         self.assertIn("regs.REG_IP = breakpoint.address", body)
 
+    def test_cross_abi_handoff_drains_synthetic_event_stop(self) -> None:
+        body = function_body(self.utils, "static bool wait_for_app_process_entry(")
+        self.assertIn("PTRACE_EVENT_STOP", body)
+        self.assertIn("stop_signal == SIGTRAP", body)
+        self.assertIn("stop_signal == SIGSTOP", body)
+        self.assertIn("stop_signal == SIGCONT", body)
+        self.assertIn("handoff_bookkeeping_stop", body)
+        self.assertLess(
+            body.index("handoff_bookkeeping_stop"),
+            body.index(
+                "disarm_entry_breakpoint(pid, &breakpoint)",
+                body.index("handoff_bookkeeping_stop"),
+            ),
+        )
+
     def test_post_exec_fd_close_requires_stable_object_identity(self) -> None:
         close_body = function_body(self.ptracer, "static void remote_close_fd_current(")
         self.assertIn("remote_fd_identity_matches", close_body)

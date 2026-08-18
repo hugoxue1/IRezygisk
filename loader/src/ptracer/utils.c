@@ -843,7 +843,36 @@ static bool wait_for_app_process_entry(pid_t pid, uintptr_t runtime_entry,
   }
 
   int status = 0;
-  wait_for_trace(pid, &status, __WALL);
+  while (1) {
+    wait_for_trace(pid, &status, __WALL);
+
+    /* A cross-ABI handoff attaches a fresh tracer to an app_process image
+       that is already held in init's SIGSTOP. On Linux 4.14/4.19 in
+       particular, the PTRACE_INTERRUPT used to take ownership can be
+       reported only after the first PTRACE_CONT, as a synthetic
+       SIGTRAP/PTRACE_EVENT_STOP. SIGCONT may then appear as its own
+       signal-delivery stop. Neither stop means that the entry breakpoint
+       fired. Drain both kernel bookkeeping stops under the same absolute
+       deadline and leave the breakpoint armed until a real SIGTRAP arrives.
+
+       This is a ptrace state-machine rule, not an Android-version or OEM
+       exception; it applies equally to 32/64-bit handoffs on Android 11-16. */
+    int stop_event = WIFSTOPPED(status) ? ((status >> 16) & 0xff) : 0;
+    int stop_signal = WIFSTOPPED(status) ? WSTOPSIG(status) : 0;
+    bool handoff_bookkeeping_stop =
+        WIFSTOPPED(status) &&
+        ((stop_event == PTRACE_EVENT_STOP &&
+          (stop_signal == SIGTRAP || stop_signal == SIGSTOP)) ||
+         (stop_event == 0 && stop_signal == SIGCONT));
+    if (!handoff_bookkeeping_stop) break;
+
+    LOGD("Draining post-exec ptrace handoff stop for pid %d: signal=%d event=%d",
+         pid, stop_signal, stop_event);
+    if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+      PLOGE("continue after post-exec ptrace handoff stop");
+      break;
+    }
+  }
   bool stopped = WIFSTOPPED(status);
   if (!stopped) {
     /* The outer deadline may have expired while the tracee was running. Stop

@@ -922,3 +922,38 @@ Android 11--16（API 30--36）走同一 ELF/ptrace 合同，没有版本分支�
 重启 Zygote。Android 13 当前设备必须以 i22 冷启动同时确认双 ABI `Reached relocated app_process ELF
 entry`、双 `injection completed`、原 Zygote PID 持续存活、maps 命中及无 `Bad file descriptor`，才可
 把 i22 从候选升级为真机通过；Android 11 也需复验，Android 12/14/15/16 仍列为 ABI/构建覆盖待设备矩阵。
+
+## 9.30 i22 真机反证与 i23 跨 ABI handoff stop 状态机
+
+Android 13/SDK 33、`ro.zygote=zygote64_32` 冷启动 i22 后，系统本身正常完成启动，原始 Zygote64/32
+PID 777/779 持续存活，没有再次出现 `app_process32` 的 `CANNOT LINK EXECUTABLE ... Bad file descriptor`，
+说明 i22 的 FD 对象身份保护已经阻断上一节的破坏性清理。但插件链只完成一半：64 位日志同时出现
+`Reached relocated app_process ELF entry`、`Resolved __libc_init` 和注入完成，当前 Zygote64 maps 命中
+Assistant 与 CkbSmartN；32 位交接后立即得到：
+
+```text
+app_process entry rendezvous failed for pid 779:
+stopped by signal TRAP (event: PTRACE_EVENT_STOP)
+post-exec handoff failed while waiting for linker readiness
+```
+
+`state.json` 因而只有 `zygote.64=1`、monitor=0，Zygote32 maps 没有模块。不能把“系统启动了”或 64 位
+maps 命中写成双 ABI 通过。
+
+根因仍在 IRezygisk provider 顶层，不在 Assistant、CkbSmartN 或 APatch：跨 ABI tracer 接管一个已由
+init `SIGSTOP` 保持的 post-exec 任务时，Linux 4.14/4.19 可以把 `PTRACE_INTERRUPT` 的合成
+`SIGTRAP/PTRACE_EVENT_STOP` 延迟到第一次 `PTRACE_CONT` 后才报告；随后还可能单独报告 SIGCONT
+signal-delivery stop。i22 把第一次 SIGTRAP 一律当作入口断点结果，而真正的软件断点必须是
+`SIGTRAP` 且 ptrace event 为 0，故过早恢复断点并安全退出。
+
+i23/560 把 entry rendezvous 改为一个有界状态机：在同一个绝对 4 秒 deadline 内，保持入口断点已安装，
+只排空 `SIGTRAP|SIGSTOP + PTRACE_EVENT_STOP` 与 event=0 的 SIGCONT bookkeeping stop；每次排空后继续
+tracee，直到收到真实 event=0 SIGTRAP、异常 stop、退出或超时。然后仍按 i22 规则在停止态恢复原指令、
+验证 PC 并回绕到原入口。代码注释明确记录 Linux 4.14/4.19 的延迟报告坑，测试也要求合成 stop 的处理
+发生在断点恢复之前。
+
+该修复不读取 Android 版本、机型或模块名，也不修改插件；它是 Android 11--16 共用的 Linux ptrace
+跨 ABI handoff 语义。离线四 ABI/API 25 构建通过只证明编译路径；i23 仍必须在本机冷启动看到 32 位
+`Draining post-exec ptrace handoff stop` 后继续到真实 entry、双 ABI injection/maps、原 PID 稳定且无
+app_process EBADF，才能登记 Android 13 真机通过。Android 11 仍需回归，Android 12/14/15/16 仍不得
+冒充实测。
