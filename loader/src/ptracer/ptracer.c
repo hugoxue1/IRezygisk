@@ -44,8 +44,48 @@ static void remote_close_fd(int pid, struct user_regs_struct *regs,
     LOGW("remote close of inherited domainless fd %d returned %ld", fd, result);
 }
 
-static void remote_close_fd_current(int pid, struct user_regs_struct *regs, int fd) {
+struct remote_fd_identity {
+  bool valid;
+  char link[128];
+};
+
+static bool capture_remote_fd_identity(int pid, int fd,
+                                       struct remote_fd_identity *identity) {
+  if (fd < 0 || identity == NULL) return false;
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+  ssize_t length = readlink(path, identity->link, sizeof(identity->link) - 1);
+  if (length <= 0 || (size_t)length >= sizeof(identity->link) - 1) {
+    identity->valid = false;
+    LOGW("cannot fingerprint inherited domainless fd %d for pid %d", fd, pid);
+    return false;
+  }
+  identity->link[length] = '\0';
+  identity->valid = true;
+  return true;
+}
+
+static bool remote_fd_identity_matches(int pid, int fd,
+                                       const struct remote_fd_identity *expected) {
+  if (expected == NULL || !expected->valid) return false;
+  struct remote_fd_identity current = { 0 };
+  return capture_remote_fd_identity(pid, fd, &current) &&
+         strcmp(current.link, expected->link) == 0;
+}
+
+static void remote_close_fd_current(int pid, struct user_regs_struct *regs, int fd,
+                                    const struct remote_fd_identity *expected) {
   if (fd < 0) return;
+  /* Android's linker sanitizes inherited descriptors during startup. Once it
+     closes our socket, the numeric slot can immediately be reused for a DT_NEEDED
+     library. i21 blindly called close(fd) after a 32-bit timeout and closed the
+     linker's library descriptor, crashing app_process32 with EBADF. Only close
+     while the stopped tracee still exposes the exact socket inode captured at
+     the exec boundary. A changed/unknown identity is owned by the linker. */
+  if (!remote_fd_identity_matches(pid, fd, expected)) {
+    LOGW("skip inherited domainless fd %d cleanup: descriptor identity changed", fd);
+    return;
+  }
   char pid_str[16];
   snprintf(pid_str, sizeof(pid_str), "%d", pid);
   struct maps_info *maps = parse_maps(pid_str);
@@ -344,7 +384,6 @@ bool inject_on_main(int pid, const char *lib_path, uintptr_t libc_init_target,
                                        claim_args, 3);
     if (claim_result != 0) {
       LOGE("APatch self-claim rejected for Zygote %d: %ld", pid, claim_result);
-      remote_close_fd(pid, &regs, syscall_gadget, inherited_domainless_fd);
       free_maps(local_map);
       free_maps(map);
       set_regs(pid, &backup);
@@ -360,7 +399,6 @@ bool inject_on_main(int pid, const char *lib_path, uintptr_t libc_init_target,
   if (!remote_csoloader_load_and_resolve_entry(pid, &regs, map, local_map, lib_path, &remote_base, &remote_size, &injector_entry)) {
     LOGE("Remote CSOLoader mapping failed");
 
-    remote_close_fd(pid, &regs, syscall_gadget, inherited_domainless_fd);
     free_maps(local_map);
     free_maps(map);
     set_regs(pid, &backup);
@@ -388,7 +426,6 @@ bool inject_on_main(int pid, const char *lib_path, uintptr_t libc_init_target,
     if (!injector_ok) LOGE("injector entry faulted at %p", (void *)regs.REG_IP);
     else LOGE("injector entry rejected daemon session");
 
-    remote_close_fd(pid, &regs, syscall_gadget, inherited_domainless_fd);
     if (syscall_gadget != 0 && remote_base != 0 && remote_size != 0) {
       long unmap_args[2] = { (long)remote_base, (long)remote_size };
       remote_syscall(pid, &regs, syscall_gadget, SYS_munmap, unmap_args, 2);
@@ -538,7 +575,7 @@ bool trace_zygote_direct(int pid, bool tango_flag, uint32_t auth_ticket) {
   uintptr_t libc_init_got_slot = 0;
   uintptr_t libc_init_resolved = 0;
 
-  /* One absolute deadline covers attach, linker stepping, remote mapping and
+  /* One absolute deadline covers attach, ELF-entry rendezvous, remote mapping and
      the injector call. No inner wait is allowed to pin a booting Zygote. */
   ptrace_wait_set_deadline_ms(4000);
 
@@ -567,14 +604,6 @@ bool trace_zygote_direct(int pid, bool tango_flag, uint32_t auth_ticket) {
 
     goto cleanup;
   }
-
-  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
-    PLOGE("direct initial syscall step");
-
-    goto cleanup;
-  }
-
-  if (!wait_for_ptrace_syscall_stop(pid, &status)) goto cleanup;
 
   if (!wait_linker_ready(pid, &libc_init_resolved, &libc_init_got_slot)) {
     LOGE("direct mode missed or failed the linker injection window");
@@ -638,6 +667,7 @@ bool trace_zygote_postexec(int pid, bool tango_flag, int inherited_domainless_fd
   int status = 0;
   bool attached = false;
   bool injected = false;
+  struct remote_fd_identity inherited_fd_identity = { 0 };
   uintptr_t libc_init_got_slot = 0;
   uintptr_t libc_init_resolved = 0;
   ptrace_wait_set_deadline_ms(4000);
@@ -663,16 +693,16 @@ bool trace_zygote_postexec(int pid, bool tango_flag, int inherited_domainless_fd
     LOGE("post-exec handoff target is not stopped: %s", status_str);
     goto cleanup;
   }
+  if (!capture_remote_fd_identity(pid, inherited_domainless_fd,
+                                  &inherited_fd_identity)) {
+    LOGE("post-exec domainless descriptor is unavailable at the exec boundary");
+    goto cleanup;
+  }
 
   if (kill(pid, SIGCONT) == -1) {
     PLOGE("resume post-exec Zygote group-stop");
     goto cleanup;
   }
-  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
-    PLOGE("post-exec initial syscall step");
-    goto cleanup;
-  }
-  if (!wait_for_ptrace_syscall_stop(pid, &status)) goto cleanup;
   if (!wait_linker_ready(pid, &libc_init_resolved, &libc_init_got_slot)) {
     LOGE("post-exec handoff failed while waiting for linker readiness");
     goto cleanup;
@@ -680,18 +710,22 @@ bool trace_zygote_postexec(int pid, bool tango_flag, int inherited_domainless_fd
 
   {
     char *lib_path = "/data/adb/modules/rezygisk/lib" LP_SELECT("", "64") "/libzygisk.so";
+    if (!remote_fd_identity_matches(pid, inherited_domainless_fd,
+                                    &inherited_fd_identity)) {
+      LOGE("post-exec domainless descriptor was replaced by the linker");
+      goto cleanup;
+    }
     bool inject_result = inject_on_main(pid, lib_path, libc_init_resolved,
                                         libc_init_got_slot, tango_flag, 0,
                                         inherited_domainless_fd);
-    /* inject_on_main either transferred the fd to libzygisk or closed it on
-       failure; the outer cleanup must not act on a recycled descriptor. */
-    inherited_domainless_fd = -1;
     if (!inject_result) {
       LOGE("post-exec handoff failed to inject");
       if (libc_init_got_slot != 0 && libc_init_resolved != 0)
         ptrace_poke_uintptr(pid, libc_init_got_slot, libc_init_resolved);
       goto cleanup;
     }
+    /* Successful injector entry owns the still-fingerprinted session. */
+    inherited_domainless_fd = -1;
   }
   injected = true;
 
@@ -709,7 +743,8 @@ cleanup:
     if (!injected && inherited_domainless_fd >= 0) {
       struct user_regs_struct close_regs = { 0 };
       if (get_regs(pid, &close_regs))
-        remote_close_fd_current(pid, &close_regs, inherited_domainless_fd);
+        remote_close_fd_current(pid, &close_regs, inherited_domainless_fd,
+                                &inherited_fd_identity);
       inherited_domainless_fd = -1;
     }
     if (!injected && libc_init_got_slot != 0 && libc_init_resolved != 0)
@@ -737,6 +772,7 @@ bool trace_zygote_preexec(int pid, bool tango_flag, uint32_t auth_ticket,
   bool attached = false;
   bool injected = false;
   int inherited_domainless_fd = -1;
+  struct remote_fd_identity inherited_fd_identity = { 0 };
   uintptr_t libc_init_got_slot = 0;
   uintptr_t libc_init_resolved = 0;
   ptrace_wait_set_deadline_ms(4000);
@@ -802,6 +838,15 @@ bool trace_zygote_preexec(int pid, bool tango_flag, uint32_t auth_ticket,
     LOGE("failed to establish the mandatory pre-exec daemon channel for Zygote %d", pid);
     goto cleanup;
   }
+  if (!capture_remote_fd_identity(pid, inherited_domainless_fd,
+                                  &inherited_fd_identity)) {
+    /* Still pre-exec: this numeric descriptor is known to be ours and cannot
+       yet have been recycled by the Android linker. */
+    remote_close_fd(pid, &regs, syscall_gadget, inherited_domainless_fd);
+    inherited_domainless_fd = -1;
+    LOGE("failed to fingerprint the mandatory pre-exec daemon channel");
+    goto cleanup;
+  }
 
   if (ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEEXEC) == -1) {
     PLOGE("set pre-exec TRACEEXEC");
@@ -859,11 +904,6 @@ bool trace_zygote_preexec(int pid, bool tango_flag, uint32_t auth_ticket,
     return false;
   }
 
-  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
-    PLOGE("initial post-exec syscall step");
-    goto cleanup;
-  }
-  if (!wait_for_ptrace_syscall_stop(pid, &status)) goto cleanup;
   if (!wait_linker_ready(pid, &libc_init_resolved, &libc_init_got_slot)) {
     LOGE("pre-exec path failed while waiting for linker readiness");
     goto cleanup;
@@ -873,16 +913,21 @@ bool trace_zygote_preexec(int pid, bool tango_flag, uint32_t auth_ticket,
     char *lib_path = "/data/adb/modules/rezygisk/lib" LP_SELECT("", "64") "/libzygisk.so";
     /* The ticket was consumed before exec; do not attempt a second claim at
        the later GOT break. */
+    if (!remote_fd_identity_matches(pid, inherited_domainless_fd,
+                                    &inherited_fd_identity)) {
+      LOGE("pre-exec domainless descriptor was replaced by the linker");
+      goto cleanup;
+    }
     bool inject_result = inject_on_main(pid, lib_path, libc_init_resolved,
                                         libc_init_got_slot, tango_flag, 0,
                                         inherited_domainless_fd);
-    inherited_domainless_fd = -1;
     if (!inject_result) {
       LOGE("pre-exec path failed to inject");
       if (libc_init_got_slot != 0 && libc_init_resolved != 0)
         ptrace_poke_uintptr(pid, libc_init_got_slot, libc_init_resolved);
       goto cleanup;
     }
+    inherited_domainless_fd = -1;
   }
   injected = true;
 
@@ -900,7 +945,8 @@ cleanup:
     if (!injected && inherited_domainless_fd >= 0) {
       struct user_regs_struct close_regs = { 0 };
       if (get_regs(pid, &close_regs))
-        remote_close_fd_current(pid, &close_regs, inherited_domainless_fd);
+        remote_close_fd_current(pid, &close_regs, inherited_domainless_fd,
+                                &inherited_fd_identity);
       inherited_domainless_fd = -1;
     }
     if (!injected && libc_init_got_slot != 0 && libc_init_resolved != 0)

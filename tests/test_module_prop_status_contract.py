@@ -33,9 +33,9 @@ class ModulePropStatusContractTest(unittest.TestCase):
         self.assertNotIn("strcat(", prepare)
         self.assertIn("module.prop has no description field", prepare)
 
-    def test_i21_version_is_monotonic(self) -> None:
-        self.assertIn("VER_NAME ?= v1.0.0-i21", self.common)
-        self.assertIn("VER_CODE ?= 558", self.common)
+    def test_i22_version_is_monotonic(self) -> None:
+        self.assertIn("VER_NAME ?= v1.0.0-i22", self.common)
+        self.assertIn("VER_CODE ?= 559", self.common)
 
 
 if __name__ == "__main__":

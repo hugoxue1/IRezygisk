@@ -507,7 +507,8 @@ static bool elf_vaddr_to_off(const ElfW(Phdr) *phdr, int phnum, ElfW(Addr) vaddr
   return false;
 }
 
-bool find_jump_slot_got_offset(const char *elf_path, const char *symbol, uintptr_t *out_bias, uintptr_t *out_got_off) {
+bool find_jump_slot_got_offset(const char *elf_path, const char *symbol, uintptr_t *out_bias,
+                               uintptr_t *out_got_off, uintptr_t *out_entry) {
   int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     PLOGE("open ELF %s", elf_path);
@@ -707,6 +708,7 @@ bool find_jump_slot_got_offset(const char *elf_path, const char *symbol, uintptr
 
     *out_bias = (uintptr_t)min_vaddr;
     *out_got_off = (uintptr_t)r_offset;
+    *out_entry = (uintptr_t)eh.e_entry;
 
     found = true;
 
@@ -721,9 +723,184 @@ bool find_jump_slot_got_offset(const char *elf_path, const char *symbol, uintptr
   return found;
 }
 
+/* Replace a few bytes in a stopped tracee without changing the surrounding
+   instruction word. PTRACE_POKETEXT is intentional: process_vm_writev cannot
+   write an RX app_process mapping and Android kernels flush the remote I-cache
+   for ptrace text writes. */
+static bool ptrace_write_text_bytes(pid_t pid, uintptr_t address,
+                                    const uint8_t *bytes, size_t length) {
+  const size_t word_size = sizeof(unsigned long);
+  size_t copied = 0;
+  while (copied < length) {
+    uintptr_t current = address + copied;
+    uintptr_t aligned = current & ~(uintptr_t)(word_size - 1);
+    size_t within = (size_t)(current - aligned);
+    size_t chunk = length - copied;
+    if (chunk > word_size - within) chunk = word_size - within;
+
+    errno = 0;
+    unsigned long word = (unsigned long)ptrace(PTRACE_PEEKTEXT, pid, (void *)aligned, 0);
+    if (errno != 0) {
+      PLOGE("ptrace peektext at 0x%" PRIxPTR, aligned);
+      return false;
+    }
+    memcpy((uint8_t *)&word + within, bytes + copied, chunk);
+    errno = 0;
+    if (ptrace(PTRACE_POKETEXT, pid, (void *)aligned, (void *)word) == -1 && errno != 0) {
+      PLOGE("ptrace poketext at 0x%" PRIxPTR, aligned);
+      return false;
+    }
+    copied += chunk;
+  }
+  return true;
+}
+
+struct entry_breakpoint {
+  uintptr_t address;
+  uint8_t original[4];
+  size_t size;
+  bool armed;
+};
+
+static bool arm_entry_breakpoint(pid_t pid, uintptr_t runtime_entry,
+                                 uintptr_t elf_entry,
+                                 struct entry_breakpoint *breakpoint) {
+  uint8_t trap[4] = { 0 };
+#if defined(__aarch64__)
+  const uint32_t instruction = 0xd4200000U; /* brk #0 */
+  memcpy(trap, &instruction, sizeof(instruction));
+  breakpoint->size = sizeof(instruction);
+  /* Android app_process commonly starts with BTI c. Replacing an indirect
+     branch landing pad itself can raise a Branch Target Exception before BRK.
+     Let the first fixed-width instruction execute and trap on the second. */
+  breakpoint->address = runtime_entry + sizeof(instruction);
+#elif defined(__arm__)
+  if ((elf_entry & 1U) != 0) {
+    const uint16_t instruction = 0xbe00U; /* Thumb bkpt #0 */
+    memcpy(trap, &instruction, sizeof(instruction));
+    breakpoint->size = sizeof(instruction);
+  } else {
+    const uint32_t instruction = 0xe1200070U; /* ARM bkpt #0 */
+    memcpy(trap, &instruction, sizeof(instruction));
+    breakpoint->size = sizeof(instruction);
+  }
+  breakpoint->address = runtime_entry & ~(uintptr_t)1;
+#elif defined(__x86_64__) || defined(__i386__)
+  trap[0] = 0xcc; /* int3 */
+  breakpoint->size = 1;
+  breakpoint->address = runtime_entry;
+  uint8_t first[4] = { 0 };
+  if (read_proc(pid, runtime_entry, first, sizeof(first)) == (ssize_t)sizeof(first) &&
+      first[0] == 0xf3 && first[1] == 0x0f && first[2] == 0x1e &&
+      (first[3] == 0xfa || first[3] == 0xfb)) {
+    /* Preserve Intel CET ENDBR64/ENDBR32 landing pads just like AArch64 BTI. */
+    breakpoint->address += sizeof(first);
+  }
+#else
+#error Unsupported ptracer architecture
+#endif
+
+  if (read_proc(pid, breakpoint->address, breakpoint->original,
+                breakpoint->size) != (ssize_t)breakpoint->size) {
+    LOGE("Failed to save app_process entry instruction at 0x%" PRIxPTR,
+         breakpoint->address);
+    return false;
+  }
+  if (!ptrace_write_text_bytes(pid, breakpoint->address, trap, breakpoint->size))
+    return false;
+  breakpoint->armed = true;
+  return true;
+}
+
+static bool disarm_entry_breakpoint(pid_t pid, struct entry_breakpoint *breakpoint) {
+  if (!breakpoint->armed) return true;
+  bool restored = ptrace_write_text_bytes(pid, breakpoint->address,
+                                          breakpoint->original,
+                                          breakpoint->size);
+  if (restored) breakpoint->armed = false;
+  return restored;
+}
+
+/* Android 11-16 all use the ELF interpreter contract: the dynamic linker
+   performs mandatory relocations/constructors and then transfers control to
+   the executable's e_entry. Waiting for that transfer avoids two unstable
+   assumptions that previously broke OEM 32-bit Zygotes: a fixed number of
+   linker syscalls and a wall-clock budget spent single-stepping every syscall.
+
+   app_process is BIND_NOW, so its __libc_init JUMP_SLOT is final when this
+   breakpoint fires. The breakpoint is always restored while the tracee is
+   stopped, including the timeout path, so an unsupported OEM fails open. */
+static bool wait_for_app_process_entry(pid_t pid, uintptr_t runtime_entry,
+                                       uintptr_t elf_entry) {
+  struct entry_breakpoint breakpoint = { 0 };
+  if (!arm_entry_breakpoint(pid, runtime_entry, elf_entry, &breakpoint))
+    return false;
+
+  if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+    PLOGE("continue to app_process ELF entry");
+    disarm_entry_breakpoint(pid, &breakpoint);
+    return false;
+  }
+
+  int status = 0;
+  wait_for_trace(pid, &status, __WALL);
+  bool stopped = WIFSTOPPED(status);
+  if (!stopped) {
+    /* The outer deadline may have expired while the tracee was running. Stop
+       it before restoring text; never detach with our breakpoint installed. */
+    if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) == 0) {
+      ptrace_wait_set_deadline_ms(300);
+      wait_for_trace(pid, &status, __WALL);
+      stopped = WIFSTOPPED(status);
+    }
+  }
+
+  if (!stopped) {
+    LOGE("Could not stop pid %d to restore app_process entry breakpoint", pid);
+    return false;
+  }
+
+  struct user_regs_struct regs = { 0 };
+  bool expected = false;
+  if (WSTOPSIG(status) == SIGTRAP && ((status >> 16) & 0xff) == 0 &&
+      get_regs(pid, &regs)) {
+#if defined(__x86_64__) || defined(__i386__)
+    expected = (uintptr_t)regs.REG_IP == breakpoint.address + 1;
+#elif defined(__aarch64__)
+    expected = regs.REG_IP == breakpoint.address ||
+               regs.REG_IP == breakpoint.address + breakpoint.size;
+#elif defined(__arm__)
+    uintptr_t stopped_pc = regs.REG_IP & ~(uintptr_t)1;
+    expected = stopped_pc == breakpoint.address ||
+               stopped_pc == breakpoint.address + breakpoint.size;
+#endif
+  }
+
+  bool restored = disarm_entry_breakpoint(pid, &breakpoint);
+  if (!expected || !restored) {
+    char status_str[64];
+    parse_status(status, status_str, sizeof(status_str));
+    LOGE("app_process entry rendezvous failed for pid %d: %s", pid, status_str);
+    return false;
+  }
+
+  /* INT3 advances x86 IP, and ARM kernel reporting differs across generations.
+     Rewind explicitly so the original first instruction executes once. */
+  regs.REG_IP = breakpoint.address;
+  if (!set_regs(pid, &regs)) {
+    LOGE("Failed to rewind pid %d to restored app_process entry", pid);
+    return false;
+  }
+  LOGI("Reached relocated app_process ELF entry 0x%" PRIxPTR " for pid %d",
+       breakpoint.address, pid);
+  return true;
+}
+
 bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *out_libc_init_got_slot) {
   char pid_str[11];
   snprintf(pid_str, sizeof(pid_str), "%d", pid);
+  uintptr_t runtime_entry = 0;
+  uintptr_t elf_entry = 0;
 
   struct maps_info *remote_map = parse_maps(pid_str);
   if (!remote_map) {
@@ -737,7 +914,8 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
     if (!m->path || m->offset != 0 || !strstr(m->path, "app_process")) continue;
 
     uintptr_t bias = 0, got_off = 0;
-    if (!find_jump_slot_got_offset(m->path, "__libc_init", &bias, &got_off)) {
+    if (!find_jump_slot_got_offset(m->path, "__libc_init", &bias, &got_off,
+                                   &elf_entry)) {
       LOGD("Failed to find __libc_init in JMPREL of '%s'", m->path);
 
       free_maps(remote_map);
@@ -746,6 +924,9 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
     }
 
     *out_libc_init_got_slot = ((uintptr_t)m->start - bias) + got_off;
+    runtime_entry = ((uintptr_t)m->start - bias) +
+                    (elf_entry & ~(uintptr_t)1);
+    break;
   }
 
   if (*out_libc_init_got_slot == 0) {
@@ -756,89 +937,47 @@ bool wait_linker_ready(int pid, uintptr_t *out_libc_init_resolved, uintptr_t *ou
   }
 
   uintptr_t initial_value = 0;
-  if (read_proc(pid, *out_libc_init_got_slot, &initial_value, sizeof(initial_value)) != sizeof(initial_value)) {
-    LOGE("Failed to read initial value of __libc_init GOT slot at 0x%" PRIxPTR, *out_libc_init_got_slot);
-
+  if (read_proc(pid, *out_libc_init_got_slot, &initial_value,
+                sizeof(initial_value)) != sizeof(initial_value)) {
+    LOGE("Failed to read initial __libc_init GOT slot at 0x%" PRIxPTR,
+         *out_libc_init_got_slot);
     free_maps(remote_map);
-
     return false;
   }
 
-  /* A direct attach may observe an already-running Zygote. If the GOT slot
-     already points into libc, __libc_init has run and there is no safe early
-     injection window left. Never wait for an impossible second resolution. */
+  /* Direct attach can see an app_process that has already passed e_entry. Do
+     not plant an entry breakpoint that can never fire. */
   uintptr_t normalized_initial = initial_value & ~(uintptr_t)1;
   for (size_t i = 0; i < remote_map->length; i++) {
     const struct map_entry *m = &remote_map->maps[i];
     if (!m->path || !strstr(m->path, "/libc.so")) continue;
-    if (normalized_initial >= (uintptr_t)m->start && normalized_initial < (uintptr_t)m->end) {
-      LOGW("__libc_init GOT is already resolved for pid %d; safe late-attach rejection", pid);
+    if (normalized_initial >= (uintptr_t)m->start &&
+        normalized_initial < (uintptr_t)m->end) {
+      LOGW("__libc_init GOT is already resolved for pid %d; safe late-attach rejection",
+           pid);
       free_maps(remote_map);
-
       return false;
     }
   }
+
+  if (!wait_for_app_process_entry(pid, runtime_entry, elf_entry)) {
+    free_maps(remote_map);
+    return false;
+  }
+
   free_maps(remote_map);
 
-  struct timespec started = {};
-  clock_gettime(CLOCK_MONOTONIC, &started);
-  unsigned long syscall_steps = 0;
-
-  /* INFO: Loop till linker changes the value (resolves the symbol) */
-  while (1) {
-    uintptr_t current_value = 0;
-    if (read_proc(pid, *out_libc_init_got_slot, &current_value, sizeof(current_value)) != sizeof(current_value)) {
-      LOGE("Failed to read current value of __libc_init GOT slot at 0x%" PRIxPTR, *out_libc_init_got_slot);
-
-      return false;
-    }
-
-    /* INFO: If value changed, linker has resolved the symbol */
-    if (current_value != initial_value) {
-      *out_libc_init_resolved = current_value;
-
-      LOGI("Resolved __libc_init (0x%" PRIxPTR " -> 0x%" PRIxPTR ", pid %d)", initial_value, current_value, pid);
-
-      return true;
-    }
-
-    struct timespec now = {};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L +
-                      (now.tv_nsec - started.tv_nsec) / 1000000L;
-    /* The exact PTRACE_EVENT_EXEC rendezvous starts before Android's dynamic
-       linker has loaded and relocated app_process dependencies.  Counting
-       syscall stops is not a time bound: on an OEM linker a fast device can
-       consume hundreds of stops in a fraction of a second while still making
-       forward progress.  The old 512-stop guard therefore rejected both
-       Zygotes after roughly 150 ms on Android 11.
-
-       Wait for the observable relocation event instead.  The monotonic limit
-       remains below the caller's 4 s ptrace deadline, the 5.5 s monitor
-       watchdog and APD's 6 s staged-target watchdog, so a stalled linker still
-       fails open without pinning boot. */
-    if (elapsed_ms > 3500L) {
-      LOGE("Timed out waiting for __libc_init resolution for pid %d after %lu syscall stops",
-           pid, syscall_steps);
-
-      return false;
-    }
-    syscall_steps++;
-
-    /* INFO: Step to the next syscall */
-    if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
-      PLOGE("ptrace PTRACE_SYSCALL");
-
-      return false;
-    }
-
-    int status = 0;
-    if (!wait_for_ptrace_syscall_stop(pid, &status)) {
-      LOGE("wait_for_ptrace_syscall_stop failed");
-
-      return false;
-    }
+  uintptr_t resolved = 0;
+  if (read_proc(pid, *out_libc_init_got_slot, &resolved, sizeof(resolved)) !=
+      sizeof(resolved) || resolved == 0 || resolved == initial_value) {
+    LOGE("Failed to read relocated __libc_init GOT slot at 0x%" PRIxPTR,
+         *out_libc_init_got_slot);
+    return false;
   }
+  *out_libc_init_resolved = resolved;
+  LOGI("Resolved __libc_init at app_process entry: 0x%" PRIxPTR " (pid %d)",
+       resolved, pid);
+  return true;
 }
 
 bool ptrace_poke_uintptr(pid_t pid, uintptr_t addr, uintptr_t value) {

@@ -4,11 +4,11 @@
 
 上游基线：ReZygisk `e42886f`（v1.0.0 / versionCode 537）
 
-当前最终真机基线：APatch 19096/3215d2a + KernelPatch 0.13.23/d23 + IRezygisk
-`v1.0.0-i21`/558/`ba2e29b` + CkbSmartN 0.101.20 + Zygisk Assistant 2.1.5-apatch1。i21 已完成
-32/64 位注入、原子状态数据报、缺失 debug PID 容错、幂等有界 `module.prop` 状态重写以及三模块共存
-回归。i15–i20 是问题收敛历史，不再作为交付基线；CkbSmartN 长期 daemon/Binder 与 Assistant
-denylist 清理仍按各自业务边界验收，不能回写成 IRezygisk 通用加载失败。
+当前恢复顶层：APatch 19107/3105291 + KernelPatch 0.13.29/d29。IRezygisk i21/558 曾在 Android 11
+完成 32/64 位及三模块共存，但 2026-08-18 的 Android 13 `zygote64_32` 真实日志推翻了它的跨版本资格：
+32 位 linker 超时后的清理会破坏 `app_process32`。i22/559 已改为 ELF entry rendezvous 和 FD 对象身份
+回收，目前是四 ABI 构建/契约候选，Android 13 冷启动验收前不得写成真机通过。CkbSmartN 长期
+daemon/Binder 与 Assistant denylist 清理仍按各自业务边界验收，不能回写成 IRezygisk 通用加载失败。
 
 目标远程：`git@github.com:hugoxue1/IRezygisk.git`
 
@@ -877,3 +877,48 @@ Zygisk API 的模块默认不需要修改；只有模块依赖固定 Magisk doma
 daemon/系统 Binder 服务，或绕过标准 module/companion 生命周期时，才需要模块侧声明并适配自己的
 额外能力。统一判断矩阵见工作区
 `docs/工程项目总览/103_APatch_模块兼容责任边界与接入矩阵_2026-08-17.md`。
+
+## 9.29 Android 13 32 位 linker 反证与 i22 的 Android 11--16 顶层 rendezvous
+
+APatch 19107/d29、IRezygisk i21、Assistant 与 CkbSmartN 全部启用后的 Android 13/SDK 33 真机启动
+不是正常通过。64 位 Zygote PID 777 已完成 `libzygisk` 注入并加载两个模块；32 位 PID 779 在跨 ABI
+handoff 后产生：
+
+```text
+Timed out waiting for __libc_init resolution for pid 779 after 7988 syscall stops
+remote close of inherited domainless fd 25 returned -22
+CANNOT LINK EXECUTABLE "/system/bin/app_process32": ... Bad file descriptor
+post-exec injection safely abandoned for 779
+```
+
+init 随后重建 Zygote64/32。新 PID 1651/1652 的 maps 均不含 IRezygisk、Assistant 或 CkbSmartN，故
+`sys.boot_completed=1` 只能证明系统恢复，不能证明插件生效。`state.json` 同时出现 monitor=0、只有
+Zygote64 状态，也与该时序一致。Assistant 和 CkbSmartN 已在第一次 64 位 Zygote 中成功加载，它们不是
+这次重启的根因；不得为二者增加 Android 13 特判。
+
+i21 的两个通用错误为：
+
+1. 在 `PTRACE_EVENT_EXEC` 后逐个执行 `PTRACE_SYSCALL`，等待 `__libc_init` GOT 改变。固定 3.5 秒主要
+   消耗在 ptrace 往返，不是 linker 的真实卡死；syscall 数量、OEM 依赖图与 Android release 都不是 ABI；
+2. 超时后按旧数字执行目标内 `close(fd)`。linker 启动期可能已关闭/复用该槽，数字 25 不再证明对象
+   仍是会话 socket，错误清理会破坏正在装载的系统 SO。
+
+i22/559 在 IRezygisk 顶层修复，不修改 APatch、Assistant、CkbSmartN 或 Vendor：
+
+- 从目标 `app_process` ELF 读取 `e_entry` 与 `__libc_init` JUMP_SLOT，在动态 linker 按 ELF 合同移交到
+  program entry 时触发一次可恢复断点；此时 Android `app_process` 的 `BIND_NOW` 重定位已经完成，不再
+  按 syscall 次数、SDK、机型或超时猜测；
+- AArch64、ARM/Thumb、x86_64、x86 分别使用 BRK/BKPT/INT3；AArch64 在第一条 BTI landing pad 之后
+  断点，x86 遇到 ENDBR64/32 也保留 landing pad，覆盖新系统控制流保护；
+- 成功与超时路径都先在 tracee 停止状态恢复原始指令并校正 PC，再进入注入或 fail-open detach；
+- 在 exec 边界记录 `/proc/<pid>/fd/N` 对应 socket inode。只有目标停止且对象身份仍相同才允许关闭；
+  identity 缺失或变化一律视为 linker 所有，不执行远程 `close`；
+- `inject_on_main()` 失败不再私自回收这个 FD，由外层统一做对象身份校验后回收。成功时才把所有权交给
+  `libzygisk`。
+
+Android 11--16（API 30--36）走同一 ELF/ptrace 合同，没有版本分支；API 25 最低编译目标与四 ABI 仍
+保留。该表述代表源码路径覆盖标准 AOSP/ACK 行为，不代表手中没有设备的每个 OEM ROM 已真机通过。
+未知 ELF、缺 JUMP_SLOT、异常控制流保护或 identity 不可证明时必须恢复入口并 fail-open，不能杀死或
+重启 Zygote。Android 13 当前设备必须以 i22 冷启动同时确认双 ABI `Reached relocated app_process ELF
+entry`、双 `injection completed`、原 Zygote PID 持续存活、maps 命中及无 `Bad file descriptor`，才可
+把 i22 从候选升级为真机通过；Android 11 也需复验，Android 12/14/15/16 仍列为 ABI/构建覆盖待设备矩阵。
