@@ -957,3 +957,20 @@ tracee，直到收到真实 event=0 SIGTRAP、异常 stop、退出或超时。�
 `Draining post-exec ptrace handoff stop` 后继续到真实 entry、双 ABI injection/maps、原 PID 稳定且无
 app_process EBADF，才能登记 Android 13 真机通过。Android 11 仍需回归，Android 12/14/15/16 仍不得
 冒充实测。
+
+## 9.31 i23 Android 13 32 位通过与 APatch 主 Zygote stop/release 反证
+
+i23 冷启动没有卡在新的 entry 状态机。32 位 PID 773 在跨 ABI handoff 后成功到达 ELF entry、解析
+`__libc_init`、注入并进入 ZygoteInit，证明 9.30 的 synthetic event-stop 修复在本机生效。卡开机的
+直接原因发生在 IRezygisk attach 之前：主服务 debug PID 772 发布后，APatch/APD 在 SIGSTOP 尚未反映
+为 `/proc` T/t 的瞬时窗口拒绝 stage，理由为 `target is not pre-exec stopped`。
+
+APD 随后的 fail-open 又只写出 `sigstop_off state=queued`，没有发送 SIGCONT。现场 PID 772 仍是 PPID 1、
+uid 0、`/system/bin/init second_stage`、`u:r:init:s0`、`TracerPid=0`、状态 T，kernel stack 停在
+`do_signal_stop`；64 位 Zygote 与 system_server 因而不存在。对同一 PID 发送 SIGCONT 后，它原地 exec
+为 zygote64，system_server PID 2960 启动并达到 boot completed。该恢复没有刷写、重启或改模块文件。
+
+APatch 19108/`320df1b` 在顶层修复：同一 PID/starttime/init identity 的 stop 落地最多有界等待 250 ms；
+release 在 `sigstop_off` 前快照 PID+starttime，之后只对同 generation 发 SIGCONT。i23 不增加 APatch
+竞态 workaround，Assistant/CkbSmartN 也不修改。当前只能登记“i23 Android 13 32 位 entry/injection
+真机通过；双 ABI 完整通过待 19108 冷启动”。
