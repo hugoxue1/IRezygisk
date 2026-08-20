@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Keep in sync with loader/src/include/daemon.h.  This is an inherited,
+ * unnamed AF_UNIX datagram endpoint, not a public module ABI. */
+#define REZYGISKD_DOMAINLESS_MONITOR_FD 196
+
 #define PROCESS_NAME_MAX_LEN 256 + 1
 
 #define ZYGOTE_INJECTED LP_SELECT(5, 4)

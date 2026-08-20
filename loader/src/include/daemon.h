@@ -5,6 +5,11 @@
 
 #include <unistd.h>
 
+/* Private monitor transport used only by an APatch-domainless zygiskd exec.
+ * The monitor duplicates the child endpoint here before exec; zygiskd marks
+ * it close-on-exec immediately after startup so companions never inherit it. */
+#define REZYGISKD_DOMAINLESS_MONITOR_FD 196
+
 enum rezygiskd_actions {
   ZygoteInjected,
   GetProcessFlags,

@@ -56,6 +56,7 @@ struct rezygiskd_status {
   bool zygote_injected;
   bool daemon_running;
   pid_t daemon_pid;
+  int monitor_fd;
   char *daemon_info;
   char *daemon_error_info;
 };
@@ -65,6 +66,7 @@ struct rezygiskd_status status64 = {
   .zygote_injected = false,
   .daemon_running = false,
   .daemon_pid = -1,
+  .monitor_fd = -1,
   .daemon_info = NULL,
   .daemon_error_info = NULL
 };
@@ -73,6 +75,7 @@ struct rezygiskd_status status32 = {
   .zygote_injected = false,
   .daemon_running = false,
   .daemon_pid = -1,
+  .monitor_fd = -1,
   .daemon_info = NULL,
   .daemon_error_info = NULL
 };
@@ -142,7 +145,7 @@ void monitor_events_loop() {
   monitor_epoll_fd = -1;
 }
 
-int monitor_sock_fd;
+int monitor_sock_fd = -1;
 
 #define MONITOR_PACKET_MAX (128u * 1024u)
 #define MONITOR_STRING_MAX PATH_MAX
@@ -260,7 +263,24 @@ bool rezygiskd_listener_init() {
   return true;
 }
 
-void rezygiskd_listener_callback() {
+static bool domainless_monitor_command_matches_abi(uint8_t cmd, int expected_abi) {
+  if (expected_abi == 0) {
+    if (!domainless_monitor_active) return true;
+    /* In domainless mode the pathname socket is control-only.  Daemon state
+       is authoritative only on the per-daemon inherited channel. */
+    return cmd == START || cmd == STOP || cmd == EXIT;
+  }
+  if (expected_abi == 64)
+    return cmd == ZYGOTE64_INJECTED || cmd == DAEMON64_SET_INFO ||
+           cmd == DAEMON64_SET_ERROR_INFO;
+  if (expected_abi == 32)
+    return cmd == ZYGOTE32_INJECTED || cmd == DAEMON32_SET_INFO ||
+           cmd == DAEMON32_SET_ERROR_INFO;
+  return false;
+}
+
+static void rezygiskd_listener_callback_fd(int fd, int expected_abi) {
+  if (fd < 0) return;
   while (1) {
     uint8_t probe = 0;
     struct iovec probe_iov = {
@@ -272,7 +292,7 @@ void rezygiskd_listener_callback() {
       .msg_iovlen = 1
     };
     ssize_t packet_size = TEMP_FAILURE_RETRY(
-      recvmsg(monitor_sock_fd, &probe_message, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT));
+      recvmsg(fd, &probe_message, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT));
     if (packet_size == -1) {
       if (errno == EINTR || errno == EWOULDBLOCK) break;
 
@@ -283,7 +303,7 @@ void rezygiskd_listener_callback() {
 
     if (packet_size <= 0 || packet_size > (ssize_t)MONITOR_PACKET_MAX) {
       /* A short receive consumes and discards the complete datagram. */
-      (void)TEMP_FAILURE_RETRY(recv(monitor_sock_fd, &probe, sizeof(probe), MSG_DONTWAIT));
+      (void)TEMP_FAILURE_RETRY(recv(fd, &probe, sizeof(probe), MSG_DONTWAIT));
       LOGE("Discard invalid monitor packet of %zd bytes", packet_size);
 
       continue;
@@ -291,13 +311,13 @@ void rezygiskd_listener_callback() {
 
     uint8_t *packet = malloc((size_t)packet_size);
     if (packet == NULL) {
-      (void)TEMP_FAILURE_RETRY(recv(monitor_sock_fd, &probe, sizeof(probe), MSG_DONTWAIT));
+      (void)TEMP_FAILURE_RETRY(recv(fd, &probe, sizeof(probe), MSG_DONTWAIT));
       PLOGE("allocate monitor packet");
       continue;
     }
 
     ssize_t nread = TEMP_FAILURE_RETRY(
-      recv(monitor_sock_fd, packet, (size_t)packet_size, MSG_DONTWAIT));
+      recv(fd, packet, (size_t)packet_size, MSG_DONTWAIT));
     if (nread != packet_size) {
       if (nread == -1) PLOGE("receive monitor packet");
       else LOGE("Short monitor packet: expected %zd, got %zd", packet_size, nread);
@@ -306,6 +326,11 @@ void rezygiskd_listener_callback() {
     }
 
     uint8_t cmd = packet[0];
+    if (!domainless_monitor_command_matches_abi(cmd, expected_abi)) {
+      LOGE("Reject monitor command %u on ReZygiskd%d private channel", cmd, expected_abi);
+      free(packet);
+      continue;
+    }
     struct monitor_packet_reader reader = {
       .data = packet,
       .size = (size_t)packet_size,
@@ -428,9 +453,22 @@ void rezygiskd_listener_callback() {
   }
 }
 
+void rezygiskd_listener_callback() {
+  rezygiskd_listener_callback_fd(monitor_sock_fd, 0);
+}
+
+static void rezygiskd_domainless_channels_callback() {
+  rezygiskd_listener_callback_fd(status64.monitor_fd, 64);
+  rezygiskd_listener_callback_fd(status32.monitor_fd, 32);
+}
+
 void rezygiskd_listener_stop() {
   if (monitor_sock_fd >= 0) close(monitor_sock_fd);
   monitor_sock_fd = -1;
+  if (status64.monitor_fd >= 0) close(status64.monitor_fd);
+  status64.monitor_fd = -1;
+  if (status32.monitor_fd >= 0) close(status32.monitor_fd);
+  status32.monitor_fd = -1;
 }
 
 #define MAX_RETRY_COUNT 5
@@ -467,9 +505,29 @@ static bool ensure_daemon_created(bool is_64bit) {
     return status->daemon_running;
   }
 
+  int monitor_channel[2] = { -1, -1 };
+  if (domainless_monitor_active) {
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, monitor_channel) == -1) {
+      PLOGE("create private ReZygiskd%s monitor channel", is_64bit ? "64" : "32");
+      return false;
+    }
+    int channel_flags = fcntl(monitor_channel[0], F_GETFL);
+    if (channel_flags == -1 ||
+        fcntl(monitor_channel[0], F_SETFL, channel_flags | O_NONBLOCK) == -1) {
+      PLOGE("make private ReZygiskd%s monitor channel nonblocking",
+            is_64bit ? "64" : "32");
+      close(monitor_channel[0]);
+      close(monitor_channel[1]);
+      return false;
+    }
+  }
+
   pid_t pid = fork();
   if (pid < 0) {
     PLOGE("create ReZygiskd%s", is_64bit ? "64" : "32");
+
+    if (monitor_channel[0] >= 0) close(monitor_channel[0]);
+    if (monitor_channel[1] >= 0) close(monitor_channel[1]);
 
     return false;
   }
@@ -478,14 +536,35 @@ static bool ensure_daemon_created(bool is_64bit) {
     char daemon_name[PATH_MAX] = "./bin/zygiskd";
     strcat(daemon_name, is_64bit ? "64" : "32");
 
-    if (domainless_monitor_active)
+    if (domainless_monitor_active) {
+      close(monitor_channel[0]);
+      if (status64.monitor_fd >= 0) close(status64.monitor_fd);
+      if (status32.monitor_fd >= 0) close(status32.monitor_fd);
+      if (monitor_channel[1] != REZYGISKD_DOMAINLESS_MONITOR_FD) {
+        if (dup2(monitor_channel[1], REZYGISKD_DOMAINLESS_MONITOR_FD) == -1) {
+          PLOGE("install private ReZygiskd%s monitor channel", is_64bit ? "64" : "32");
+          _exit(1);
+        }
+        close(monitor_channel[1]);
+      }
+      if (fcntl(REZYGISKD_DOMAINLESS_MONITOR_FD, F_SETFD, 0) == -1) {
+        PLOGE("make private ReZygiskd%s monitor channel inheritable",
+              is_64bit ? "64" : "32");
+        _exit(1);
+      }
       execl(daemon_name, daemon_name, "--apatch-domainless-v1", NULL);
-    else
+    } else {
       execl(daemon_name, daemon_name, NULL);
+    }
 
     PLOGE("exec ReZygiskd%s failed", is_64bit ? "64" : "32");
 
-    exit(1);
+    _exit(1);
+  }
+
+  if (domainless_monitor_active) {
+    close(monitor_channel[1]);
+    status->monitor_fd = monitor_channel[0];
   }
 
   status->supported = true;
@@ -510,6 +589,10 @@ static bool ensure_daemon_created(bool is_64bit) {
                                                                   \
     LOGW("daemon" #abi " pid %d exited: %s", pid, status_str);    \
     status##abi.daemon_running = false;                           \
+    if (status##abi.monitor_fd >= 0) {                            \
+      close(status##abi.monitor_fd);                              \
+      status##abi.monitor_fd = -1;                               \
+    }                                                             \
                                                                   \
     if (!status##abi.daemon_error_info) {                         \
       status##abi.daemon_error_info = strdup(status_str);         \
@@ -1718,6 +1801,15 @@ void init_domainless_monitor() {
     exit(1);
   }
 
+  /* Seal the APatch broker descriptor CLOEXEC before any daemon is forked.
+     Daemons receive only their dedicated anonymous monitor channel. */
+  int broker_fd = domainless_open_broker();
+  if (broker_fd == -1) {
+    sigchld_listener_stop();
+    rezygiskd_listener_stop();
+    exit(1);
+  }
+
   /* Start the native-ABI daemon while init is still held by APatch. Waiting
      until app_process appears would spend the most valuable part of the
      injection window on a daemon fork/exec. */
@@ -1725,13 +1817,7 @@ void init_domainless_monitor() {
   (void)ensure_daemon_created(native_is_64bit);
   struct rezygiskd_status *native_status = native_is_64bit ? &status64 : &status32;
   if (native_status->daemon_pid == -1) {
-    sigchld_listener_stop();
-    rezygiskd_listener_stop();
-    exit(1);
-  }
-
-  int broker_fd = domainless_open_broker();
-  if (broker_fd == -1) {
+    close(broker_fd);
     sigchld_listener_stop();
     rezygiskd_listener_stop();
     exit(1);
@@ -1750,6 +1836,7 @@ void init_domainless_monitor() {
     /* The listener is nonblocking, so this handles status/control datagrams
        without a second thread while /proc discovery owns the main loop. */
     rezygiskd_listener_callback();
+    rezygiskd_domainless_channels_callback();
     sigchld_listener_callback();
 
     if (tracing_state == TRACING) domainless_discover_preexec_targets(broker_fd);

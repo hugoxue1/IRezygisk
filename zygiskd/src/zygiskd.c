@@ -297,7 +297,20 @@ static void monitor_packet_append(uint8_t **cursor, const void *data, size_t siz
 /* SOCK_DGRAM preserves datagram boundaries. A logical message therefore has
    to be sent as one datagram: splitting the fields lets the independently
    starting 32-bit and 64-bit daemons interleave their payloads. */
-static bool send_monitor_error(const char *message) {
+static bool send_monitor_packet(bool apatch_domainless, const void *packet, size_t size) {
+  if (!apatch_domainless) return unix_datagram_sendto(CONTROLLER_SOCKET, packet, size);
+
+  ssize_t sent = TEMP_FAILURE_RETRY(
+      send(REZYGISKD_DOMAINLESS_MONITOR_FD, packet, size, MSG_NOSIGNAL));
+  if (sent != (ssize_t)size) {
+    if (sent == -1) LOGE("send monitor packet: %s", strerror(errno));
+    else LOGE("short monitor packet: expected %zu, sent %zd", size, sent);
+    return false;
+  }
+  return true;
+}
+
+static bool send_monitor_error(const char *message, bool apatch_domainless) {
   size_t message_size = strlen(message);
   if (message_size > UINT32_MAX) return false;
 
@@ -321,12 +334,13 @@ static bool send_monitor_error(const char *message) {
   monitor_packet_append(&cursor, &encoded_size, sizeof(encoded_size));
   monitor_packet_append(&cursor, message, message_size);
 
-  bool sent = unix_datagram_sendto(CONTROLLER_SOCKET, packet, packet_size);
+  bool sent = send_monitor_packet(apatch_domainless, packet, packet_size);
   free(packet);
   return sent;
 }
 
-static bool send_monitor_info(const struct Context *context, const char *root_impl) {
+static bool send_monitor_info(const struct Context *context, const char *root_impl,
+                              bool apatch_domainless) {
   size_t root_impl_size = strlen(root_impl);
   if (root_impl_size > UINT32_MAX || context->len > UINT32_MAX) return false;
 
@@ -368,7 +382,7 @@ static bool send_monitor_info(const struct Context *context, const char *root_im
     monitor_packet_append(&cursor, context->modules[i].name, module_name_size);
   }
 
-  bool sent = unix_datagram_sendto(CONTROLLER_SOCKET, packet, packet_size);
+  bool sent = send_monitor_packet(apatch_domainless, packet, packet_size);
   free(packet);
   return sent;
 }
@@ -383,6 +397,26 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
   struct root_impl impl;
   get_impl(&impl);
   int socket_fd = -1;
+  if (apatch_domainless) {
+    int type = 0;
+    socklen_t type_size = sizeof(type);
+    if (fcntl(REZYGISKD_DOMAINLESS_MONITOR_FD, F_GETFD) == -1 ||
+        getsockopt(REZYGISKD_DOMAINLESS_MONITOR_FD, SOL_SOCKET, SO_TYPE,
+                   &type, &type_size) == -1 ||
+        type != SOCK_DGRAM) {
+      LOGE("APatch domainless monitor transport is missing or invalid");
+      return;
+    }
+
+    /* The daemon and its no-exec session children keep this endpoint.  Any
+       later companion exec must not inherit the private monitor channel. */
+    int fd_flags = fcntl(REZYGISKD_DOMAINLESS_MONITOR_FD, F_GETFD);
+    if (fd_flags == -1 ||
+        fcntl(REZYGISKD_DOMAINLESS_MONITOR_FD, F_SETFD, fd_flags | FD_CLOEXEC) == -1) {
+      LOGE("Failed to seal APatch domainless monitor transport: %s", strerror(errno));
+      return;
+    }
+  }
   if (apatch_domainless && impl.impl != APatch) {
     LOGE("APatch domainless daemon mode rejected outside APatch");
     return;
@@ -393,7 +427,8 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
     else msg = "Unsupported environment: Multiple root implementations found";
 
     LOGE("%s", msg);
-    if (!send_monitor_error(msg)) LOGE("Failed to send daemon error to monitor");
+    if (!send_monitor_error(msg, apatch_domainless))
+      LOGE("Failed to send daemon error to monitor");
 
     exit(EXIT_FAILURE);
   } else {
@@ -404,7 +439,7 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
     socket_fd = create_daemon_socket(apatch_domainless);
     if (socket_fd == -1) {
       LOGE("Failed creating daemon socket");
-      if (!send_monitor_error("Failed creating daemon socket"))
+      if (!send_monitor_error("Failed creating daemon socket", apatch_domainless))
         LOGE("Failed to send daemon socket error to monitor");
       free_modules(&context);
       root_impl_cleanup();
@@ -413,7 +448,7 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
 
     char impl_name[LONGEST_ROOT_IMPL_NAME];
     stringify_root_impl_name(impl, impl_name);
-    if (send_monitor_info(&context, impl_name)) {
+    if (send_monitor_info(&context, impl_name, apatch_domainless)) {
       LOGI("Sent atomic root implementation and modules information to controller socket");
     } else {
       LOGE("Failed to send daemon information to monitor");
@@ -514,7 +549,8 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
 
     switch (action) {
       case ZygoteInjected: {
-        unix_datagram_sendto(CONTROLLER_SOCKET, &(uint8_t){ ZYGOTE_INJECTED }, sizeof(uint8_t));
+        (void)send_monitor_packet(apatch_domainless,
+                                  &(uint8_t){ ZYGOTE_INJECTED }, sizeof(uint8_t));
 
         break;
       }

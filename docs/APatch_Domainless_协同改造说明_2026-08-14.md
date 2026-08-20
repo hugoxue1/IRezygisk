@@ -1063,3 +1063,23 @@ companion、模块扫描与 FD ignore/hiding 均不改变；i22 ELF entry、i23 
 tracer-generation arm，不能与只接受 `READY 1` 的 AP 混装。本轮按明确要求没有执行测试、构建或设备
 命令；Android 11--16、双 ABI injection/maps、CkbSmartN/Assistant callback 以及隐藏效果均不得从静态
 源码直接提升为 runtime passed。
+
+## 9.35 i27 daemon readiness 匿名通道
+
+i26 + AP 19156 的 fresh boot 首个 64 位失败发生在 tracer/target 流程之前：`zygiskd64` 已完成 root
+识别和 arm64 模块枚举，但向 pathname `init_monitor` 发送 `DAEMON64_SET_INFO` 时 `connect` 返回
+`EACCES`，随后按错误分支正常退出；32 位 daemon 数毫秒后在同一路径成功。该证据说明 pathname
+readiness 仍受 inode 权限、socket SID 和线程 sockcreate 切换时序共同影响，不能作为双 ABI 原子启动
+合同。它不是 d39 `mm_access` 路径失败，也不是 Vendor broker 或模块 native crash。
+
+i27/564 仅替换 daemon 与 monitor 之间的内部状态通道：monitor 每次 fork daemon 前创建独立、无名称
+`AF_UNIX/SOCK_DGRAM` socketpair，父端非阻塞并按 ABI 单独消费，child 端经固定私有 FD 穿过第一次
+zygiskd exec；zygiskd 验证其 `SO_TYPE` 后立即设置 `FD_CLOEXEC`，所以后续 companion exec 不继承。
+info/error/zygote-injected packet 保持原有字节格式和 command 数值；domainless pathname listener 只再
+接受 START/STOP/EXIT，不能伪造 daemon readiness。AP broker FD 在 fork daemon 前先设 CLOEXEC，避免
+daemon 延长 broker 生命周期。
+
+本改动不修改 action 0--9、action 9 的 Zygote-labelled匿名持久 socketpair、CkbSmartN/Assistant API、
+模块索引、companion、FD hiding、AP/KP wire、Vendor origin 10/service broker，也不增加 allow、permissive
+domain 或可枚举 abstract socket 名。按用户要求只提交源码，不运行测试或构建；runtime 状态仍待用户
+自行编译刷入后确认。

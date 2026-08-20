@@ -9,7 +9,17 @@
 - [`APatch_Domainless_协同改造说明_2026-08-14.md`](./APatch_Domainless_协同改造说明_2026-08-14.md)：
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
-当前源码候选为 `v1.0.0-i26` / 563。fresh boot 证据推翻了把 i25 控制 listener 当作当前首个失败点的
+当前源码候选为 `v1.0.0-i27` / 564。i26 + AP 19156 fresh boot 显示系统没有 native crash：
+`zygiskd64` 在模块枚举后向 pathname `init_monitor` 发布 readiness 时 `connect: EACCES`，随后按代码
+主动 `exit 0`；32 位同一路径稍后碰巧成功。这证明 daemon readiness 不能继续依赖 pathname inode 与
+反复切换线程 `sockcreate` context。i27 由 monitor 在每次 fork 32/64 daemon 前分别创建无名称
+`AF_UNIX/SOCK_DGRAM` socketpair，child 仅在首次 exec 继承固定私有端点，daemon 启动后立即设
+`FD_CLOEXEC`，companion 不继承；monitor 只接受与该通道 ABI 一致的 info/error/injected 命令，pathname
+`init_monitor` 在 domainless 模式降为 START/STOP/EXIT 控制面。这样 readiness 不再执行 `/data/adb`
+pathname connect，也不再切换 sockcreate；action 9、持久 session、模块 ABI、companion、FD hiding、
+APatch Vendor broker 与 live SELinux policy 均不改变。按用户要求本轮只改源码，不运行测试或构建。
+
+i26/563 的 fresh boot 证据推翻了把 i25 控制 listener 当作当前首个失败点的
 判断：64 位 stage 已成功，随后 tracer PID 793 在进入 `trace_zygote_preexec()` 的第一步
 `PTRACE_SEIZE` 收到 `u:r:init:s0 -> u:r:init:s0 process:ptrace` 拒绝；provider PID 784 稍后出现的
 `CAP_SYS_PTRACE` 拒绝不是这条执行链的首个 load-bearing failure。目标任务的 self-claim 位于 attach
@@ -27,7 +37,8 @@ Zygote sockcreate context，以及 action 9 的 Zygote 标签持久 socketpair �
 必要边界，但其“target connect 是当前首个失败点”诊断已被 fresh boot 证据 supersede。i26 不改变
 daemon action、Zygisk module/companion ABI、模块扫描、FD hiding、i22/i23 ELF/跨 ABI handoff，也不新增
 live-policy 或 Vendor 特判。该提交只实现 ReZygisk wire-v2 client，必须与匹配的 AP/KP 一起使用；本轮按
-要求不运行测试、构建或设备操作，因此不能登记为 runtime passed。
+要求不运行测试、构建或设备操作，因此不能登记为 runtime passed。i27 仅 supersede daemon readiness
+pathname transport，不改变这一 tracer/target wire-v2 合同。
 
 当前已通过的双模块底座为 `v1.0.0-i18` / 555（IRezygisk + CkbSmartN）；三模块复验确认注入、daemon、
 Assistant 清理和 CkbSmartN companion 均正常，但暴露 MIUI 不发布 `init.svc_debug_pid.*` 时的假重启状态
