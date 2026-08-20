@@ -17,8 +17,10 @@
 fork 一个由私有 CLOEXEC `SOCK_SEQPACKET` 门控的 tracer，父进程读取其精确 PID/starttime，再用单条
 `STAGE_PREEXEC_ZYGOTE service target abi tracer_pid tracer_starttime` 请求让配套 AP/KP 原子签发目标
 ticket 并 arm 该 tracer generation；只有 AP 精确回显全部身份后，ticket 才通过固定宽度二进制私有帧
-交给 child，绝不进入 argv/env。ready、stage、trace 共用一个 5.5 秒绝对 watchdog；任何 mismatch、EOF
-或超时都会 kill/wait child，并由既有 broker release 路径安全释放 target。
+交给 child，绝不进入 argv/env。单个 5.5 秒绝对 deadline 约束 child-ready poll、STAGED 响应读取与
+tracer wait；短小的同步 `dprintf`/gate `send` 本身不是 poll-bounded，写失败会立即进入 fail-closed。
+任何 identity mismatch、读取 EOF 或受控等待超时都会 kill/wait child，并由既有 broker release 路径
+安全释放 target。
 
 i25 的显式 domainless argv 门控、init 标签 pathname listener、`adb_data_file` inode、发布 ready 前恢复
 Zygote sockcreate context，以及 action 9 的 Zygote 标签持久 socketpair 全部保留；它修复的标签分层仍是

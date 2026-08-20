@@ -1041,18 +1041,21 @@ provider -> AP: STAGE_PREEXEC_ZYGOTE <service> <target_pid> <abi> <tracer_pid> <
 AP -> provider: STAGED <service> <target_pid> <ticket> <tracer_pid> <tracer_starttime>
 ```
 
-provider 不发送 phase count；配套 AP 必须根据 provider native `usize::BITS` 与 target ABI 自己推导同 ABI
-一阶段或跨 ABI 两阶段，不能信任 wire 输入。ReZygisk 在请求 STAGE 之前创建 CLOEXEC 私有
+provider 不发送 phase count；配套 AP 必须根据已密封到 `BrokerRequest.provider_abi` 的 provider ABI 与
+target ABI 自己推导同 ABI 一阶段或跨 ABI 两阶段，不能信任未密封的 wire 身份字段。ReZygisk 在请求
+STAGE 之前创建 CLOEXEC 私有
 `SOCK_SEQPACKET` 并 fork：child 先用固定宽度帧报告自身 PID 后阻塞，父进程从 `/proc/<pid>/stat` 读取
 starttime，再把 target 与 tracer 两个 generation 一次提交给 AP/KP。只有 STAGED 对 service、target、
 ticket、tracer PID/starttime 全部精确回显且 ticket 合法，父进程才通过同一私有 socket 的固定宽度二进制
 launch frame 交付 ticket；ticket 不写 argv、环境或 pathname socket。child 在收到并验证 frame 后才调用
 既有 `trace_zygote_preexec()`，所以 `PTRACE_SEIZE` 不可能早于 tracer arm。
 
-从 fork 前开始的单个 5.5 秒 `CLOCK_MONOTONIC` absolute deadline 同时覆盖 child ready、broker stage 与
-tracer 完成，不能在阶段切换时重置。任一 timeout、broker EOF、partial/mismatched echo、gate frame 错误
-或 trace 失败都关闭 gate、kill/wait tracer child，并通过原有 `RELEASE_PREEXEC_ZYGOTE ... FAIL` 路径
-释放 target。成功仍走原有 `... OK` release。i25 的显式 domainless argv 门控、init/`adb_data_file`
+从 fork 前开始的单个 5.5 秒 `CLOCK_MONOTONIC` absolute deadline 由 child-ready poll、broker STAGED
+响应的 poll/逐字节读取及 tracer `waitpid` 循环共同检查，不能在这些等待阶段之间重置。它不把
+`socketpair`/`fork` 或短小的同步 `dprintf`/gate `send` 变成可中断的 poll-bounded 操作；写失败会立即
+fail closed。任一受控等待 timeout、broker EOF、partial/mismatched echo、gate frame 错误或 trace 失败
+都关闭 gate、kill/wait tracer child，并通过原有 `RELEASE_PREEXEC_ZYGOTE ... FAIL` 路径释放 target。
+成功仍走原有 `... OK` release。i25 的显式 domainless argv 门控、init/`adb_data_file`
 控制 listener、恢复 Zygote sockcreate、action 9 Zygote-labelled session、daemon action 0--9、模块 ABI、
 companion、模块扫描与 FD ignore/hiding 均不改变；i22 ELF entry、i23 cross-ABI handoff 也保持原样。
 
