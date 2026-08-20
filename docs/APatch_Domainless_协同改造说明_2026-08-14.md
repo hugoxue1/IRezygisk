@@ -1009,8 +1009,10 @@ exec 前 SIGSTOP rendezvous 中仍是 `u:r:init:s0`。这个控制连接只用�
 i25/562 由 `monitor-domainless` fork daemon 时传入私有的 exact argv 模式，daemon 同时复核 root 实现确为
 APatch；不能只凭 `root_impl == APatch` 推断，否则会破坏旧 APatch legacy 的 post-exec Zygote 客户端。
 该模式以 `u:r:init:s0` sockcreate context 创建 `cp32/cp64` 控制 listener，并把 pathname inode 严格标为
-`u:object_r:adb_data_file:s0`，同时消除 pathname `sock_file:write` 与 peer `connectto` 两个不必要的跨域
-边界。listener 创建后必须成功恢复 `u:r:zygote:s0`，否则关闭 listener、删除 socket 路径并 fail closed。
+`u:object_r:adb_data_file:s0`。这消除了 peer `connectto` 的 init→zygote 跨域，同时把仍然存在的
+`sock_file:write` 检查固定到通用 adb_data_file 类型；后者继续由目标刚完成的普通 task-local self-claim
+授权处理，不能在文档中写成“检查消失”。listener 创建后必须成功恢复 `u:r:zygote:s0`，否则关闭
+listener、删除 socket 路径并 fail closed。
 action 9 handler 的持久 socketpair 因而继续是 Zygote 标签，既有 session framing、CkbSmartN、Assistant、
 companion、模块索引和 FD hiding 均不改变。其他 root implementation 仍按旧行为创建 Zygote listener。
 

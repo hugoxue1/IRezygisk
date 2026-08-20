@@ -156,7 +156,7 @@ bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
     return false;
   }
 
-  set_socket_create_context(current_attr);
+  if (!set_socket_create_context_checked(current_attr)) return false;
 
   struct sockaddr_un addr = {
     .sun_family = AF_UNIX
@@ -166,9 +166,7 @@ bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
   int socket_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
   if (socket_fd == -1) {
     LOGE("socket: %s", strerror(errno));
-
-    set_socket_create_context("u:r:zygote:s0");
-
+    (void)set_socket_create_context_checked("u:r:zygote:s0");
     return false;
   }
 
@@ -176,9 +174,17 @@ bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
     LOGE("connect: %s", strerror(errno));
 
     close(socket_fd);
+    (void)set_socket_create_context_checked("u:r:zygote:s0");
+    return false;
+  }
 
-    set_socket_create_context("u:r:zygote:s0");
-
+  /* A monitor packet is the domainless daemon's readiness publication.  The
+     socket needed to reach the init-owned monitor is already connected, so
+     restore the Zygote sockcreate context before sending any bytes.  If this
+     fails, do not publish readiness: otherwise action 9 could create its
+     cross-exec socketpair with the init label. */
+  if (!set_socket_create_context_checked("u:r:zygote:s0")) {
+    close(socket_fd);
     return false;
   }
 
@@ -186,13 +192,8 @@ bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, s
     LOGE("sendto: %s", strerror(errno));
 
     close(socket_fd);
-
-    set_socket_create_context("u:r:zygote:s0");
-
     return false;
   }
-
-  set_socket_create_context("u:r:zygote:s0");
 
   close(socket_fd);
   return true;

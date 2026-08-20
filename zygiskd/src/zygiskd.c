@@ -417,6 +417,13 @@ void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
       LOGI("Sent atomic root implementation and modules information to controller socket");
     } else {
       LOGE("Failed to send daemon information to monitor");
+      if (apatch_domainless) {
+        close(socket_fd);
+        unlink(PATH_CP_NAME);
+        free_modules(&context);
+        root_impl_cleanup();
+        return;
+      }
     }
   }
 
