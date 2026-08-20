@@ -1073,6 +1073,8 @@ static bool prepare_environment() {
 #define DOMAINLESS_DISCOVERY_IDLE_US 20000
 #define DOMAINLESS_AUTH_TIMEOUT_MS 750
 #define DOMAINLESS_TRACE_TIMEOUT_MS 5500
+#define DOMAINLESS_TRACER_GATE_MAGIC 0x49525432u
+#define DOMAINLESS_TRACER_GATE_VERSION 2u
 
 static pid_t domainless_targets[DOMAINLESS_MAX_TARGETS];
 static bool domainless_target_is64[DOMAINLESS_MAX_TARGETS];
@@ -1086,6 +1088,24 @@ struct domainless_zygote_service {
   pid_t completed_pid;
   bool rendezvous_consumed;
 };
+
+struct domainless_tracer_ready {
+  uint32_t magic;
+  uint32_t version;
+  int32_t tracer_pid;
+};
+
+struct domainless_tracer_launch {
+  uint32_t magic;
+  uint32_t version;
+  int32_t target_pid;
+  uint32_t ticket;
+};
+
+_Static_assert(sizeof(struct domainless_tracer_ready) == 12,
+               "domainless tracer ready frame must remain fixed-width");
+_Static_assert(sizeof(struct domainless_tracer_launch) == 16,
+               "domainless tracer launch frame must remain fixed-width");
 
 static struct domainless_zygote_service domainless_services[2];
 static size_t domainless_service_count = 0;
@@ -1126,14 +1146,14 @@ static int domainless_open_broker() {
   }
 
   int fd = (int)parsed;
-  if (dprintf(fd, "READY 1\n") < 0) {
+  if (dprintf(fd, "READY 2\n") < 0) {
     PLOGE("send READY to APatch early-loader broker");
 
     return -1;
   }
 
   char response[128];
-  if (!domainless_read_line(fd, response, sizeof(response)) || strcmp(response, "OK READY") != 0) {
+  if (!domainless_read_line(fd, response, sizeof(response)) || strcmp(response, "OK READY 2") != 0) {
     LOGE("APatch early-loader broker rejected READY");
 
     return -1;
@@ -1147,52 +1167,144 @@ static int domainless_open_broker() {
   return fd;
 }
 
-static bool domainless_stage_target(int broker_fd, const char *service, pid_t pid,
-                                    bool is_64bit, uint32_t *ticket) {
-  LOGI("Requesting APatch pre-exec self-claim ticket for %s/Zygote%s target %d",
-       service, is_64bit ? "64" : "32", pid);
-  if (dprintf(broker_fd, "STAGE_PREEXEC_ZYGOTE %s %d %d\n",
-              service, pid, is_64bit ? 64 : 32) < 0) {
-    PLOGE("request Zygote authorization ticket");
+static int domainless_deadline_remaining_ms(const struct timespec *deadline) {
+  struct timespec now = { 0 };
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) return -1;
 
+  long long remaining_ns = ((long long)deadline->tv_sec - now.tv_sec) * 1000000000LL +
+                           ((long long)deadline->tv_nsec - now.tv_nsec);
+  if (remaining_ns <= 0) return 0;
+
+  long long remaining_ms = (remaining_ns + 999999LL) / 1000000LL;
+  return remaining_ms > INT_MAX ? INT_MAX : (int)remaining_ms;
+}
+
+static bool domainless_poll_readable_until(int fd, const struct timespec *deadline) {
+  struct pollfd input = {
+    .fd = fd,
+    .events = POLLIN | POLLHUP
+  };
+
+  while (1) {
+    int remaining_ms = domainless_deadline_remaining_ms(deadline);
+    if (remaining_ms <= 0) return false;
+
+    int ready = poll(&input, 1, remaining_ms);
+    if (ready == -1 && errno == EINTR) continue;
+    return ready > 0 && (input.revents & (POLLIN | POLLHUP)) != 0;
+  }
+}
+
+static bool domainless_read_line_until(int fd, char *buf, size_t size,
+                                       const struct timespec *deadline) {
+  if (size == 0) return false;
+
+  size_t used = 0;
+  while (used + 1 < size) {
+    if (!domainless_poll_readable_until(fd, deadline)) return false;
+
+    char c;
+    ssize_t nread = read(fd, &c, 1);
+    if (nread == -1 && errno == EINTR) continue;
+    if (nread != 1) return false;
+    if (c == '\n') {
+      buf[used] = '\0';
+      return true;
+    }
+    buf[used++] = c;
+  }
+
+  buf[used] = '\0';
+  return false;
+}
+
+static bool domainless_read_starttime(pid_t pid, unsigned long long *starttime) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+  FILE *stat_file = fopen(path, "re");
+  if (stat_file == NULL) return false;
+
+  char line[1024];
+  bool valid = false;
+  if (fgets(line, sizeof(line), stat_file) != NULL) {
+    char *cursor = strrchr(line, ')');
+    if (cursor != NULL) {
+      cursor++;
+      /* /proc/PID/stat field 2 is the parenthesized comm. Walk fields 3--22
+         instead of splitting comm, which may itself contain spaces or ')'. */
+      for (int field = 3; field <= 22; field++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (*cursor == '\0') break;
+
+        char *token_end = cursor;
+        while (*token_end != '\0' && !isspace((unsigned char)*token_end)) token_end++;
+        if (field == 22) {
+          bool decimal = token_end != cursor;
+          for (char *digit = cursor; digit < token_end; digit++)
+            if (!isdigit((unsigned char)*digit)) decimal = false;
+          errno = 0;
+          char *parsed_end = NULL;
+          unsigned long long parsed = strtoull(cursor, &parsed_end, 10);
+          valid = decimal && errno == 0 && parsed_end == token_end && parsed != 0;
+          if (valid) *starttime = parsed;
+          break;
+        }
+        cursor = token_end;
+      }
+    }
+  }
+  fclose(stat_file);
+  return valid;
+}
+
+static bool domainless_stage_target(int broker_fd, const char *service, pid_t target_pid,
+                                    bool is_64bit, pid_t tracer_pid,
+                                    unsigned long long tracer_starttime,
+                                    const struct timespec *deadline, uint32_t *ticket) {
+  LOGI("Requesting APatch pre-exec target ticket and tracer arm for %s/Zygote%s "
+       "target %d tracer %d/%llu",
+       service, is_64bit ? "64" : "32", target_pid, tracer_pid, tracer_starttime);
+  if (dprintf(broker_fd, "STAGE_PREEXEC_ZYGOTE %s %d %d %d %llu\n",
+              service, target_pid, is_64bit ? 64 : 32, tracer_pid,
+              tracer_starttime) < 0) {
+    PLOGE("request Zygote authorization and tracer arm");
     return false;
   }
 
-  struct pollfd response_poll = {
-    .fd = broker_fd,
-    .events = POLLIN | POLLHUP
-  };
-  int ready;
-  do {
-    ready = poll(&response_poll, 1, DOMAINLESS_AUTH_TIMEOUT_MS);
-  } while (ready == -1 && errno == EINTR);
-  if (ready <= 0 || !(response_poll.revents & (POLLIN | POLLHUP))) {
-    if (ready == 0) LOGE("APatch authorization staging timed out for Zygote %d", pid);
-    else PLOGE("wait for APatch authorization staging of Zygote %d", pid);
+  if (!domainless_poll_readable_until(broker_fd, deadline)) {
+    LOGE("APatch authorization staging timed out for Zygote %d", target_pid);
     monitor_stop_reason = "APatch authorization staging unavailable";
     tracing_state = STOPPED;
     update_status(NULL);
-
     return false;
   }
 
-  char response[128];
-  if (!domainless_read_line(broker_fd, response, sizeof(response))) {
-    LOGE("APatch early-loader broker disconnected");
-
+  char response[192];
+  if (!domainless_read_line_until(broker_fd, response, sizeof(response), deadline)) {
+    LOGE("APatch early-loader broker disconnected or sent an incomplete STAGED response");
     return false;
   }
 
-  int response_pid = -1;
+  int response_target_pid = -1;
+  int response_tracer_pid = -1;
   unsigned response_ticket = 0;
+  unsigned long long response_tracer_starttime = 0;
   char response_service[32] = { 0 };
   char trailing = '\0';
-  if (sscanf(response, "STAGED %31s %d %u %c", response_service, &response_pid,
-             &response_ticket, &trailing) != 3 ||
-      strcmp(response_service, service) != 0 || response_pid != pid ||
+  int fields = sscanf(response, "STAGED %31s %d %u %d %llu %c", response_service,
+                      &response_target_pid, &response_ticket, &response_tracer_pid,
+                      &response_tracer_starttime, &trailing);
+  char expected[192];
+  int expected_length = snprintf(expected, sizeof(expected), "STAGED %s %d %u %d %llu",
+                                 service, target_pid, response_ticket, tracer_pid,
+                                 tracer_starttime);
+  if (fields != 5 || expected_length < 0 || expected_length >= (int)sizeof(expected) ||
+      strcmp(response, expected) != 0 || strcmp(response_service, service) != 0 ||
+      response_target_pid != target_pid || response_tracer_pid != tracer_pid ||
+      response_tracer_starttime != tracer_starttime ||
       response_ticket == 0 || response_ticket > INT32_MAX) {
-    LOGW("APatch denied Zygote %d authorization staging: %s", pid, response);
-
+    LOGW("APatch denied or mismatched Zygote %d authorization staging: %s",
+         target_pid, response);
     return false;
   }
 
@@ -1320,24 +1432,120 @@ static void domainless_forget_dead_targets() {
     update_status("Injected Zygote restarted after the one-shot rendezvous; reboot required");
 }
 
-static bool domainless_run_tracer(int broker_fd, pid_t pid, bool is_64bit, uint32_t ticket) {
+static void domainless_kill_and_wait_tracer(pid_t child) {
+  if (kill(child, SIGKILL) == -1 && errno != ESRCH)
+    PLOGE("kill gated pre-exec tracer %d", child);
+
+  int status = 0;
+  while (waitpid(child, &status, 0) == -1 && errno == EINTR) {}
+}
+
+static bool domainless_run_tracer(int broker_fd, const char *service,
+                                  pid_t pid, bool is_64bit) {
+  struct timespec deadline = { 0 };
+  if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
+    PLOGE("start pre-exec tracer watchdog");
+    return false;
+  }
+  deadline.tv_sec += DOMAINLESS_TRACE_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (DOMAINLESS_TRACE_TIMEOUT_MS % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
+  int gate[2] = { -1, -1 };
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, gate) == -1) {
+    PLOGE("create private pre-exec tracer gate");
+    return false;
+  }
+
   pid_t child = fork();
 
   if (child == 0) {
     close(broker_fd);
 
+    close(gate[0]);
+    struct domainless_tracer_ready ready = {
+      .magic = DOMAINLESS_TRACER_GATE_MAGIC,
+      .version = DOMAINLESS_TRACER_GATE_VERSION,
+      .tracer_pid = getpid()
+    };
+    if (send(gate[1], &ready, sizeof(ready), MSG_NOSIGNAL) != (ssize_t)sizeof(ready))
+      _exit(1);
+
+    struct domainless_tracer_launch launch = { 0 };
+    ssize_t received;
+    do {
+      received = recv(gate[1], &launch, sizeof(launch), 0);
+    } while (received == -1 && errno == EINTR);
+    close(gate[1]);
+    if (received != (ssize_t)sizeof(launch) || launch.magic != DOMAINLESS_TRACER_GATE_MAGIC ||
+        launch.version != DOMAINLESS_TRACER_GATE_VERSION ||
+        launch.target_pid != pid || launch.ticket == 0 || launch.ticket > INT32_MAX)
+      _exit(1);
+
     /* Every pre-exec service child still has init's native ABI. The native
        monitor therefore performs the self-claim and crosses PTRACE_EVENT_EXEC;
        trace_zygote_preexec performs an exact-boundary ABI handoff when the new
        app_process image has the other bitness. */
-    _exit(trace_zygote_preexec(pid, false, ticket, is_64bit) ? 0 : 1);
+    _exit(trace_zygote_preexec(pid, false, launch.ticket, is_64bit) ? 0 : 1);
   } else if (child == -1) {
+    close(gate[0]);
+    close(gate[1]);
     LOGE("failed to fork pre-exec tracer for %d", pid);
     return false;
   }
 
-  struct timespec started = { 0 };
-  clock_gettime(CLOCK_MONOTONIC, &started);
+  close(gate[1]);
+
+  struct domainless_tracer_ready ready = { 0 };
+  ssize_t received = -1;
+  if (domainless_poll_readable_until(gate[0], &deadline)) {
+    do {
+      received = recv(gate[0], &ready, sizeof(ready), 0);
+    } while (received == -1 && errno == EINTR);
+  }
+  if (received != (ssize_t)sizeof(ready) || ready.magic != DOMAINLESS_TRACER_GATE_MAGIC ||
+      ready.version != DOMAINLESS_TRACER_GATE_VERSION || ready.tracer_pid != child) {
+    LOGE("pre-exec tracer %d failed its private readiness gate", child);
+    close(gate[0]);
+    domainless_kill_and_wait_tracer(child);
+    return false;
+  }
+
+  unsigned long long tracer_starttime = 0;
+  if (!domainless_read_starttime(child, &tracer_starttime)) {
+    LOGE("cannot bind pre-exec tracer %d to its process generation", child);
+    close(gate[0]);
+    domainless_kill_and_wait_tracer(child);
+    return false;
+  }
+
+  uint32_t ticket = 0;
+  if (!domainless_stage_target(broker_fd, service, pid, is_64bit, child,
+                               tracer_starttime, &deadline, &ticket)) {
+    close(gate[0]);
+    domainless_kill_and_wait_tracer(child);
+    return false;
+  }
+
+  struct domainless_tracer_launch launch = {
+    .magic = DOMAINLESS_TRACER_GATE_MAGIC,
+    .version = DOMAINLESS_TRACER_GATE_VERSION,
+    .target_pid = pid,
+    .ticket = ticket
+  };
+  if (send(gate[0], &launch, sizeof(launch), MSG_NOSIGNAL) != (ssize_t)sizeof(launch)) {
+    PLOGE("release authorized pre-exec tracer %d", child);
+    close(gate[0]);
+    domainless_kill_and_wait_tracer(child);
+    return false;
+  }
+  close(gate[0]);
+
+  LOGI("APatch staged %s/Zygote%s target %d and armed tracer %d/%llu",
+       service, is_64bit ? "64" : "32", pid, child, tracer_starttime);
   int status = 0;
   while (1) {
     pid_t waited = waitpid(child, &status, WNOHANG);
@@ -1347,15 +1555,9 @@ static bool domainless_run_tracer(int broker_fd, pid_t pid, bool is_64bit, uint3
       return false;
     }
 
-    struct timespec now = { 0 };
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L +
-                      (now.tv_nsec - started.tv_nsec) / 1000000L;
-    if (elapsed_ms >= DOMAINLESS_TRACE_TIMEOUT_MS) {
+    if (domainless_deadline_remaining_ms(&deadline) <= 0) {
       LOGE("pre-exec tracer watchdog expired for %d", pid);
-      kill(child, SIGKILL);
-      waitpid(child, &status, 0);
-      kill(pid, SIGCONT);
+      domainless_kill_and_wait_tracer(child);
       return false;
     }
     usleep(1000);
@@ -1394,18 +1596,7 @@ static void domainless_consider_target(int broker_fd,
     return;
   }
 
-  uint32_t ticket = 0;
-  if (!domainless_stage_target(broker_fd, service->name, pid, is_64bit, &ticket)) {
-    struct rezygiskd_status *status = is_64bit ? &status64 : &status32;
-    status->zygote_injected = false;
-    update_status("APatch rejected the pre-exec Zygote target; released safely");
-    (void)domainless_release_target(broker_fd, service->name, pid, false);
-    return;
-  }
-
-  LOGI("APatch staged pre-exec %s/Zygote%s target %d for self-claim",
-       service->name, is_64bit ? "64" : "32", pid);
-  bool injected = domainless_run_tracer(broker_fd, pid, is_64bit, ticket);
+  bool injected = domainless_run_tracer(broker_fd, service->name, pid, is_64bit);
   (void)domainless_release_target(broker_fd, service->name, pid, injected);
   if (!injected) {
     struct rezygiskd_status *status = is_64bit ? &status64 : &status32;

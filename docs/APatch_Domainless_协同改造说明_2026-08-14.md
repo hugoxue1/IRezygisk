@@ -1021,3 +1021,42 @@ daemon readiness，因此不会再在 socket 尚未创建的窗口 stage 一次�
 live SELinux rule、不引入 permissive/domain 名称、不修改 KernelPatch task auth，也不触碰 APatch Vendor
 origin 10/private preload broker。当前只完成源码修改；按用户要求未执行测试，双 ABI injection/maps、
 CkbSmartN/Assistant callback 与 Vendor 对照由用户刷入后验收。
+
+## 9.34 fresh boot 反证与 i26 fork-first tracer 身份绑定
+
+后续 fresh boot 证据推翻了 9.33 对“当前首个失败点”的判断。现场至少 64 位 stage 已成功，真正第一条
+load-bearing denial 是 tracer PID 793 在 `trace_zygote_preexec()` 开头执行 `PTRACE_SEIZE` 时触发的
+`u:r:init:s0 -> u:r:init:s0 process:ptrace`；provider PID 784 稍后出现的 `CAP_SYS_PTRACE` denial 不在
+这条首个失败调用之前。旧流程先让 AP/KP 给 target self-claim ticket，再 fork tracer；而 target 要到
+attach 成功后才执行 self-claim。现有 claimed-permit matcher 绑定 current target task 且要求跨 SID，
+既不能覆盖独立 tracer caller，也不能覆盖现场 init→init attach。因此 i25 listener 标签修复仍保留，
+但 9.33 把 target remote connect 认作当前根因的结论已 superseded。
+
+i26/563 使用 broker wire v2，协议固定为：
+
+```text
+provider -> AP: READY 2
+AP -> provider: OK READY 2
+provider -> AP: STAGE_PREEXEC_ZYGOTE <service> <target_pid> <abi> <tracer_pid> <tracer_starttime>
+AP -> provider: STAGED <service> <target_pid> <ticket> <tracer_pid> <tracer_starttime>
+```
+
+provider 不发送 phase count；配套 AP 必须根据 provider native `usize::BITS` 与 target ABI 自己推导同 ABI
+一阶段或跨 ABI 两阶段，不能信任 wire 输入。ReZygisk 在请求 STAGE 之前创建 CLOEXEC 私有
+`SOCK_SEQPACKET` 并 fork：child 先用固定宽度帧报告自身 PID 后阻塞，父进程从 `/proc/<pid>/stat` 读取
+starttime，再把 target 与 tracer 两个 generation 一次提交给 AP/KP。只有 STAGED 对 service、target、
+ticket、tracer PID/starttime 全部精确回显且 ticket 合法，父进程才通过同一私有 socket 的固定宽度二进制
+launch frame 交付 ticket；ticket 不写 argv、环境或 pathname socket。child 在收到并验证 frame 后才调用
+既有 `trace_zygote_preexec()`，所以 `PTRACE_SEIZE` 不可能早于 tracer arm。
+
+从 fork 前开始的单个 5.5 秒 `CLOCK_MONOTONIC` absolute deadline 同时覆盖 child ready、broker stage 与
+tracer 完成，不能在阶段切换时重置。任一 timeout、broker EOF、partial/mismatched echo、gate frame 错误
+或 trace 失败都关闭 gate、kill/wait tracer child，并通过原有 `RELEASE_PREEXEC_ZYGOTE ... FAIL` 路径
+释放 target。成功仍走原有 `... OK` release。i25 的显式 domainless argv 门控、init/`adb_data_file`
+控制 listener、恢复 Zygote sockcreate、action 9 Zygote-labelled session、daemon action 0--9、模块 ABI、
+companion、模块扫描与 FD ignore/hiding 均不改变；i22 ELF entry、i23 cross-ABI handoff 也保持原样。
+
+本节只登记 ReZygisk 端 wire-v2 client 源码边界。它需要 AP/KP 同版本原子实现 target ticket 与 exact
+tracer-generation arm，不能与只接受 `READY 1` 的 AP 混装。本轮按明确要求没有执行测试、构建或设备
+命令；Android 11--16、双 ABI injection/maps、CkbSmartN/Assistant callback 以及隐藏效果均不得从静态
+源码直接提升为 runtime passed。

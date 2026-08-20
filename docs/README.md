@@ -9,16 +9,23 @@
 - [`APatch_Domainless_协同改造说明_2026-08-14.md`](./APatch_Domainless_协同改造说明_2026-08-14.md)：
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
-当前源码候选为 `v1.0.0-i25` / 562。i24 已在 APatch hidden-first 真机启动中证明其新增 CLOEXEC 复核
-尚未到达：目标完成 self-claim 后，首先在连接 `cp*.sock` 时收到 EACCES。根因是 pathname listener 与
-真正跨 exec 的持久 session 被错误地共用了 Zygote sockcreate context；此时客户端仍是 pre-exec init
-任务，控制连接不应跨到 Zygote socket SID。i25 只在显式 `monitor-domainless` 启动的 daemon 中以 init
-socket context 创建这个短期控制 listener，并把 pathname inode 精确标为通用 `adb_data_file`；随后在
-发布 daemon ready 前恢复 Zygote sockcreate context。其他 APatch legacy 启动不受影响；action 9 创建并经
-`SCM_RIGHTS` 返回的持久 socketpair 仍保持 Zygote 标签。daemon 的模块信息也改为在 listener 完成
-bind/listen 后才发布，避免“信息已到但 socket 尚未 ready”的竞态。它不新增 live-policy、permissive
-domain、KernelPatch/Vendor 权限、daemon action、模块/companion ABI 或 FD hiding。i25 未由本轮执行测试，
-必须由用户冷启动确认双 ABI 注入与模块回调后才能登记为 runtime passed。
+当前源码候选为 `v1.0.0-i26` / 563。fresh boot 证据推翻了把 i25 控制 listener 当作当前首个失败点的
+判断：64 位 stage 已成功，随后 tracer PID 793 在进入 `trace_zygote_preexec()` 的第一步
+`PTRACE_SEIZE` 收到 `u:r:init:s0 -> u:r:init:s0 process:ptrace` 拒绝；provider PID 784 稍后出现的
+`CAP_SYS_PTRACE` 拒绝不是这条执行链的首个 load-bearing failure。目标任务的 self-claim 位于 attach
+之后，因此不能授权尚未 attach 的独立 tracer child。i26 把 APatch broker 协议提升为 `READY 2`：先
+fork 一个由私有 CLOEXEC `SOCK_SEQPACKET` 门控的 tracer，父进程读取其精确 PID/starttime，再用单条
+`STAGE_PREEXEC_ZYGOTE service target abi tracer_pid tracer_starttime` 请求让配套 AP/KP 原子签发目标
+ticket 并 arm 该 tracer generation；只有 AP 精确回显全部身份后，ticket 才通过固定宽度二进制私有帧
+交给 child，绝不进入 argv/env。ready、stage、trace 共用一个 5.5 秒绝对 watchdog；任何 mismatch、EOF
+或超时都会 kill/wait child，并由既有 broker release 路径安全释放 target。
+
+i25 的显式 domainless argv 门控、init 标签 pathname listener、`adb_data_file` inode、发布 ready 前恢复
+Zygote sockcreate context，以及 action 9 的 Zygote 标签持久 socketpair 全部保留；它修复的标签分层仍是
+必要边界，但其“target connect 是当前首个失败点”诊断已被 fresh boot 证据 supersede。i26 不改变
+daemon action、Zygisk module/companion ABI、模块扫描、FD hiding、i22/i23 ELF/跨 ABI handoff，也不新增
+live-policy 或 Vendor 特判。该提交只实现 ReZygisk wire-v2 client，必须与匹配的 AP/KP 一起使用；本轮按
+要求不运行测试、构建或设备操作，因此不能登记为 runtime passed。
 
 当前已通过的双模块底座为 `v1.0.0-i18` / 555（IRezygisk + CkbSmartN）；三模块复验确认注入、daemon、
 Assistant 清理和 CkbSmartN companion 均正常，但暴露 MIUI 不发布 `init.svc_debug_pid.*` 时的假重启状态
