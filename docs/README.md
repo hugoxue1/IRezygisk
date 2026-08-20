@@ -9,6 +9,14 @@
 - [`APatch_Domainless_协同改造说明_2026-08-14.md`](./APatch_Domainless_协同改造说明_2026-08-14.md)：
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
+当前源码候选为 `v1.0.0-i24` / 561。它保留 i22 的 ELF-entry/FD identity fail-safe 和 i23 的跨 ABI
+handoff stop 状态机，只在目标通过 `SCM_RIGHTS` 收到 Zygote 标签会话端点后，用目标内 `fcntl` 明确
+读取 `F_GETFD`、按需清除 `FD_CLOEXEC`，并再次读取复核。任一步失败或复核仍有 CLOEXEC 都在 exec
+前关闭新端点并安全退出注入；不会新增 live-policy、permissive domain、持久命名 socket，也不改变
+daemon action、模块/companion ABI 或 FD hiding。下文 i14/i15 对“端点自然跨 exec”的描述属于历史设计
+假设；i15 的真机结果证明 SCM_RIGHTS/Zygote socket 标签路径可行，不等于证明所有 Android/OEM 都不会
+在该端点设置 CLOEXEC。i24 尚未构建或真机复验，不能描述成稳定发布或 Android 11--16 全部实测通过。
+
 当前已通过的双模块底座为 `v1.0.0-i18` / 555（IRezygisk + CkbSmartN）；三模块复验确认注入、daemon、
 Assistant 清理和 CkbSmartN companion 均正常，但暴露 MIUI 不发布 `init.svc_debug_pid.*` 时的假重启状态
 误报。`v1.0.0-i19` / 556 已在源码提交 `3694e3c` 修复，当前仍是待刷入真机候选。domainless 配套最低

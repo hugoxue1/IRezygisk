@@ -170,6 +170,39 @@ static int remote_recv_fd(int pid, struct user_regs_struct *regs,
   return -1;
 }
 
+static bool remote_make_fd_inheritable(int pid, struct user_regs_struct *regs,
+                                       uintptr_t syscall_gadget, int fd) {
+  long getfd_args[3] = { fd, F_GETFD, 0 };
+  long flags = remote_syscall(pid, regs, syscall_gadget, SYS_fcntl,
+                              getfd_args, 3);
+  if (flags < 0) {
+    LOGE("pre-exec session fd %d F_GETFD failed: %ld", fd, flags);
+    return false;
+  }
+
+  if ((flags & FD_CLOEXEC) != 0) {
+    long setfd_args[3] = { fd, F_SETFD, flags & ~FD_CLOEXEC };
+    long setfd_result = remote_syscall(pid, regs, syscall_gadget, SYS_fcntl,
+                                       setfd_args, 3);
+    if (setfd_result != 0) {
+      LOGE("pre-exec session fd %d F_SETFD failed: %ld", fd, setfd_result);
+      return false;
+    }
+  }
+
+  flags = remote_syscall(pid, regs, syscall_gadget, SYS_fcntl, getfd_args, 3);
+  if (flags < 0) {
+    LOGE("pre-exec session fd %d F_GETFD verification failed: %ld", fd,
+         flags);
+    return false;
+  }
+  if ((flags & FD_CLOEXEC) != 0) {
+    LOGE("pre-exec session fd %d remains FD_CLOEXEC", fd);
+    return false;
+  }
+  return true;
+}
+
 /* Establish and authenticate the daemon channel before exec, while Android's
    init service child can still traverse /data/adb. The explicitly-bound
    abstract client name also keeps old Zygote FD inspection safe on releases
@@ -258,6 +291,10 @@ static int remote_open_domainless_session_preexec(int pid,
      a daemon-created socketpair endpoint before crossing exec. */
   int session_fd = remote_recv_fd(pid, regs, syscall_gadget, fd, io_remote);
   if (session_fd < 0) goto cleanup;
+  if (!remote_make_fd_inheritable(pid, regs, syscall_gadget, session_fd)) {
+    remote_close_fd(pid, regs, syscall_gadget, session_fd);
+    goto cleanup;
+  }
   remote_close_fd(pid, regs, syscall_gadget, fd);
   fd = session_fd;
 

@@ -974,3 +974,22 @@ APatch 19108/`320df1b` 在顶层修复：同一 PID/starttime/init identity 的 
 release 在 `sigstop_off` 前快照 PID+starttime，之后只对同 generation 发 SIGCONT。i23 不增加 APatch
 竞态 workaround，Assistant/CkbSmartN 也不修改。当前只能登记“i23 Android 13 32 位 entry/injection
 真机通过；双 ABI 完整通过待 19108 冷启动”。
+
+## 9.32 i24 hidden-first 会话 FD 继承契约
+
+i14/i15 把经 `SCM_RIGHTS` 收到的 Zygote 标签 socketpair 端点直接保留到目标 exec；这段历史路径验证了
+socket 标签与既有 daemon 协议，但“收到的端点必然没有 `FD_CLOEXEC`”不是可以跨 Android/OEM 依赖的
+继承契约。i24/561 不改为 post-exec 重连，也不增加长期 abstract listener。目标在 pre-exec 收到端点后，
+立即通过既有 `remote_syscall()` 执行 `fcntl(F_GETFD)`；若发现 `FD_CLOEXEC`，就以保留其他 descriptor
+flags 的方式执行 `fcntl(F_SETFD, flags & ~FD_CLOEXEC)`，随后无条件再次 `F_GETFD`。初读、清除、复核
+任一步失败，或复核仍残留 CLOEXEC，都会先关闭刚收到的端点，再走现有 fail-open 清理，绝不把不确定
+状态带过 exec。
+
+该恢复只收紧 IRezygisk 自己的 FD 继承边界：i22 ELF-entry rendezvous、FD identity guard、匿名 payload
+mapping 与 i23 跨 ABI stop draining 保持不变；daemon action 0--9、Zygisk module ABI、companion 协议、
+模块扫描和 FD hiding 也不变。APatch 继续走 hidden-first 的 generic early-loader，不创建 live-policy rule、
+专用 permissive domain 或 Vendor 特判；Vendor private preload 仍由独立 broker 边界负责。因此本节取代旧文档
+中把 i14/i15 “自然跨 exec”当作普遍保证的解释，但不删除那些历史验证记录。
+
+i24 当前只登记为源码候选。本轮没有执行构建、测试或设备操作；Android 11--16 的 ABI 路径兼容结论仍需
+由后续构建和用户持有设备冷启动证据确认，不能由这次静态修改提升为 runtime passed。
