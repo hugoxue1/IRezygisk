@@ -9,13 +9,16 @@
 - [`APatch_Domainless_协同改造说明_2026-08-14.md`](./APatch_Domainless_协同改造说明_2026-08-14.md)：
   APatch minimal-v1、early-loader-v1、直接 Zygote 注入、无 live-policy 模块模式、回退和真机门禁。
 
-当前源码候选为 `v1.0.0-i24` / 561。它保留 i22 的 ELF-entry/FD identity fail-safe 和 i23 的跨 ABI
-handoff stop 状态机，只在目标通过 `SCM_RIGHTS` 收到 Zygote 标签会话端点后，用目标内 `fcntl` 明确
-读取 `F_GETFD`、按需清除 `FD_CLOEXEC`，并再次读取复核。任一步失败或复核仍有 CLOEXEC 都在 exec
-前关闭新端点并安全退出注入；不会新增 live-policy、permissive domain、持久命名 socket，也不改变
-daemon action、模块/companion ABI 或 FD hiding。下文 i14/i15 对“端点自然跨 exec”的描述属于历史设计
-假设；i15 的真机结果证明 SCM_RIGHTS/Zygote socket 标签路径可行，不等于证明所有 Android/OEM 都不会
-在该端点设置 CLOEXEC。i24 尚未构建或真机复验，不能描述成稳定发布或 Android 11--16 全部实测通过。
+当前源码候选为 `v1.0.0-i25` / 562。i24 已在 APatch hidden-first 真机启动中证明其新增 CLOEXEC 复核
+尚未到达：目标完成 self-claim 后，首先在连接 `cp*.sock` 时收到 EACCES。根因是 pathname listener 与
+真正跨 exec 的持久 session 被错误地共用了 Zygote sockcreate context；此时客户端仍是 pre-exec init
+任务，控制连接不应跨到 Zygote socket SID。i25 只在显式 `monitor-domainless` 启动的 daemon 中以 init
+socket context 创建这个短期控制 listener，并把 pathname inode 精确标为通用 `adb_data_file`；随后在
+发布 daemon ready 前恢复 Zygote sockcreate context。其他 APatch legacy 启动不受影响；action 9 创建并经
+`SCM_RIGHTS` 返回的持久 socketpair 仍保持 Zygote 标签。daemon 的模块信息也改为在 listener 完成
+bind/listen 后才发布，避免“信息已到但 socket 尚未 ready”的竞态。它不新增 live-policy、permissive
+domain、KernelPatch/Vendor 权限、daemon action、模块/companion ABI 或 FD hiding。i25 未由本轮执行测试，
+必须由用户冷启动确认双 ABI 注入与模块回调后才能登记为 runtime passed。
 
 当前已通过的双模块底座为 `v1.0.0-i18` / 555（IRezygisk + CkbSmartN）；三模块复验确认注入、daemon、
 Assistant 清理和 CkbSmartN companion 均正常，但暴露 MIUI 不发布 `init.svc_debug_pid.*` 时的假重启状态

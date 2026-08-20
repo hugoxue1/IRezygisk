@@ -993,3 +993,29 @@ mapping 与 i23 跨 ABI stop draining 保持不变；daemon action 0--9、Zygisk
 
 i24 当前只登记为源码候选。本轮没有执行构建、测试或设备操作；Android 11--16 的 ABI 路径兼容结论仍需
 由后续构建和用户持有设备冷启动证据确认，不能由这次静态修改提升为 runtime passed。
+
+## 9.33 i25 控制 listener 与持久 session 的标签分层
+
+i24 配合 APatch hidden-first 基线冷启动后，provider、双 ABI daemon、模块枚举、AP stage 与目标内
+self-claim 均已成功；第一条失败日志是 pre-exec init 目标连接 `/data/adb/rezygisk/cp64.sock` 返回
+`-EACCES`。因此 CLOEXEC 修复尚未执行，不能继续把失败归因于 exec 后 descriptor 继承。
+
+根因在 zygiskd 的 socket 生命周期分层：`create_daemon_socket()` 先把线程 sockcreate context 设置为
+`u:r:zygote:s0`，pathname 控制 listener 因而也成为 Zygote socket；但 APatch 的连接者在 init 的
+exec 前 SIGSTOP rendezvous 中仍是 `u:r:init:s0`。这个控制连接只用于发送 action 9 和接收替换端点，
+本身不会跨 exec。真正需要跨 exec 的对象，是 action 9 handler 随后创建并通过 `SCM_RIGHTS` 返回的
+匿名 socketpair 端点。
+
+i25/562 由 `monitor-domainless` fork daemon 时传入私有的 exact argv 模式，daemon 同时复核 root 实现确为
+APatch；不能只凭 `root_impl == APatch` 推断，否则会破坏旧 APatch legacy 的 post-exec Zygote 客户端。
+该模式以 `u:r:init:s0` sockcreate context 创建 `cp32/cp64` 控制 listener，并把 pathname inode 严格标为
+`u:object_r:adb_data_file:s0`，同时消除 pathname `sock_file:write` 与 peer `connectto` 两个不必要的跨域
+边界。listener 创建后必须成功恢复 `u:r:zygote:s0`，否则关闭 listener、删除 socket 路径并 fail closed。
+action 9 handler 的持久 socketpair 因而继续是 Zygote 标签，既有 session framing、CkbSmartN、Assistant、
+companion、模块索引和 FD hiding 均不改变。其他 root implementation 仍按旧行为创建 Zygote listener。
+
+同一修复把 `DAEMON*_SET_INFO` 的发布移到 listener 成功 bind/listen 之后。monitor 仍把这个 packet 作为
+daemon readiness，因此不会再在 socket 尚未创建的窗口 stage 一次性 Zygote rendezvous。此调整不创建
+live SELinux rule、不引入 permissive/domain 名称、不修改 KernelPatch task auth，也不触碰 APatch Vendor
+origin 10/private preload broker。当前只完成源码修改；按用户要求未执行测试，双 ABI injection/maps、
+CkbSmartN/Assistant callback 与 Vendor 对照由用户刷入后验收。

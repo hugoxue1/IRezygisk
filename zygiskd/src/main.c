@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "root_impl/common.h"
@@ -10,7 +11,10 @@
 int main(int argc, char *argv[]) {
   LOGI("Welcome to ReZygiskd%s", LP_SELECT("32", "64"));
 
-  if (argc > 1) {
+  bool apatch_domainless =
+      argc == 2 && strcmp(argv[1], "--apatch-domainless-v1") == 0;
+
+  if (argc > 1 && !apatch_domainless) {
     if (strcmp(argv[1], "companion") == 0) {
       if (argc < 3) {
         LOGI("Usage: zygiskd companion <fd>");
@@ -57,7 +61,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   root_impls_setup();
-  zygiskd_start(argv);
+  zygiskd_start(argv, apatch_domainless);
 
   return 0;
 }

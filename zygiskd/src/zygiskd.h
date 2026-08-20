@@ -1,6 +1,8 @@
 #ifndef ZYGISKD_H
 #define ZYGISKD_H
 
-void zygiskd_start(char *restrict argv[]);
+#include <stdbool.h>
+
+void zygiskd_start(char *restrict argv[], bool apatch_domainless);
 
 #endif /* ZYGISKD_H */

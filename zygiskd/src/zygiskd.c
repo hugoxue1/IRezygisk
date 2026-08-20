@@ -133,10 +133,31 @@ static void free_modules(struct Context *restrict context) {
   free(context->modules);
 }
 
-static int create_daemon_socket(void) {
-  set_socket_create_context("u:r:zygote:s0");
+static int create_daemon_socket(bool apatch_domainless) {
+  /* APatch stops the future Zygote immediately before exec, while it is still
+     an init-domain task.  The pathname listener is only the short-lived
+     control transport used to request a replacement session endpoint; making
+     that listener a Zygote socket forces an unnecessary init -> zygote
+     connectto decision and fails under hidden-first enforcing policy.
 
-  return unix_listener_from_path(PATH_CP_NAME);
+     Keep only this APatch control listener in init's socket context.  Restore
+     the Zygote sockcreate context before publishing daemon readiness so the
+     action-9 handler's socketpair (the endpoint that actually crosses exec)
+     remains Zygote-labelled exactly as before. */
+  const char *listener_context =
+      apatch_domainless ? "u:r:init:s0" : "u:r:zygote:s0";
+  if (!set_socket_create_context_checked(listener_context)) return -1;
+
+  int socket_fd = apatch_domainless
+      ? unix_listener_from_path_checked_context(
+            PATH_CP_NAME, "u:object_r:adb_data_file:s0")
+      : unix_listener_from_path(PATH_CP_NAME);
+  if (!set_socket_create_context_checked("u:r:zygote:s0")) {
+    if (socket_fd >= 0) close(socket_fd);
+    unlink(PATH_CP_NAME);
+    return -1;
+  }
+  return socket_fd;
 }
 
 static int spawn_companion(char *restrict argv[], char *restrict name, int lib_fd) {
@@ -353,7 +374,7 @@ static bool send_monitor_info(const struct Context *context, const char *root_im
 }
 
 /* WARNING: Dynamic memory based */
-void zygiskd_start(char *restrict argv[]) {
+void zygiskd_start(char *restrict argv[], bool apatch_domainless) {
   /* INFO: When implementation is None or Multiple, it won't set the values
             for the context, causing it to have garbage values. In response
             to that, "= { 0 }" is used to ensure that the values are clean. */
@@ -361,6 +382,11 @@ void zygiskd_start(char *restrict argv[]) {
 
   struct root_impl impl;
   get_impl(&impl);
+  int socket_fd = -1;
+  if (apatch_domainless && impl.impl != APatch) {
+    LOGE("APatch domainless daemon mode rejected outside APatch");
+    return;
+  }
   if (impl.impl == None || impl.impl == Multiple) {
     const char *msg = NULL;
     if (impl.impl == None) msg = "Unsupported environment: Unknown root implementation";
@@ -373,6 +399,18 @@ void zygiskd_start(char *restrict argv[]) {
   } else {
     load_modules(&context);
 
+    /* The monitor treats DAEMON*_SET_INFO as readiness.  Bind/listen first so
+       it cannot stage a stopped Zygote into a not-yet-created control socket. */
+    socket_fd = create_daemon_socket(apatch_domainless);
+    if (socket_fd == -1) {
+      LOGE("Failed creating daemon socket");
+      if (!send_monitor_error("Failed creating daemon socket"))
+        LOGE("Failed to send daemon socket error to monitor");
+      free_modules(&context);
+      root_impl_cleanup();
+      return;
+    }
+
     char impl_name[LONGEST_ROOT_IMPL_NAME];
     stringify_root_impl_name(impl, impl_name);
     if (send_monitor_info(&context, impl_name)) {
@@ -380,17 +418,6 @@ void zygiskd_start(char *restrict argv[]) {
     } else {
       LOGE("Failed to send daemon information to monitor");
     }
-  }
-
-  int socket_fd = create_daemon_socket();
-  if (socket_fd == -1) {
-    LOGE("Failed creating daemon socket");
-
-    free_modules(&context);
-
-    root_impl_cleanup();
-
-    return;
   }
 
   struct sigaction sa = { .sa_handler = SIG_IGN };

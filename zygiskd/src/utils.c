@@ -70,7 +70,7 @@ void get_property(const char *restrict name, char *restrict output) {
   __system_property_get(name, output);
 }
 
-void set_socket_create_context(const char *restrict context) {
+bool set_socket_create_context_checked(const char *restrict context) {
   FILE *sockcreate = fopen("/proc/thread-self/attr/sockcreate", "w");
   if (sockcreate == NULL) {
     LOGE("Failed to open sockcreate with %d: %s. Retrying with tid.", errno, strerror(errno));
@@ -86,9 +86,13 @@ void set_socket_create_context(const char *restrict context) {
     goto fail;
   }
 
-  fclose(sockcreate);
+  if (fclose(sockcreate) == EOF) {
+    LOGE("Failed to close sockcreate with %d: %s. Retrying with tid.", errno, strerror(errno));
 
-  return;
+    goto fail;
+  }
+
+  return true;
 
   fail:
     ;
@@ -99,16 +103,25 @@ void set_socket_create_context(const char *restrict context) {
     if (sockcreate == NULL) {
       LOGE("Failed to open tid sockcreate with %d: %s", errno, strerror(errno));
 
-      return;
+      return false;
     }
 
     if (fwrite(context, 1, strlen(context), sockcreate) != strlen(context)) {
       LOGE("Failed to write to tid sockcreate with %d: %s", errno, strerror(errno));
 
-      return;
+      fclose(sockcreate);
+      return false;
     }
 
-    fclose(sockcreate);
+    if (fclose(sockcreate) == EOF) {
+      LOGE("Failed to close tid sockcreate with %d: %s", errno, strerror(errno));
+      return false;
+    }
+    return true;
+}
+
+void set_socket_create_context(const char *restrict context) {
+  (void)set_socket_create_context_checked(context);
 }
 
 static bool get_current_attr(char *restrict output, size_t size) {
@@ -189,7 +202,9 @@ int chcon(const char *restrict path, const char *context) {
   return lsetxattr(path, "security.selinux", context, strlen(context) + 1, 0);
 }
 
-int unix_listener_from_path(const char *restrict path) {
+static int unix_listener_from_path_impl(const char *restrict path,
+                                        const char *restrict context,
+                                        bool context_required) {
   if (remove(path) == -1 && errno != ENOENT) {
     LOGE("remove: %s", strerror(errno));
 
@@ -224,10 +239,30 @@ int unix_listener_from_path(const char *restrict path) {
     return -1;
   }
 
-  if (chcon(path, "u:object_r:zygisk_file:s0") == -1)
+  if (context != NULL && chcon(path, context) == -1) {
+    if (context_required) {
+      LOGE("chcon: %s", strerror(errno));
+      close(socket_fd);
+      remove(path);
+      return -1;
+    }
     LOGW("chcon (non-fatal): %s", strerror(errno));
+  }
 
   return socket_fd;
+}
+
+int unix_listener_from_path(const char *restrict path) {
+  return unix_listener_from_path_impl(path, "u:object_r:zygisk_file:s0", false);
+}
+
+int unix_listener_from_path_checked_context(const char *restrict path,
+                                            const char *restrict context) {
+  if (context == NULL || context[0] == '\0') {
+    errno = EINVAL;
+    return -1;
+  }
+  return unix_listener_from_path_impl(path, context, true);
 }
 
 ssize_t write_fd(int fd, int sendfd) {

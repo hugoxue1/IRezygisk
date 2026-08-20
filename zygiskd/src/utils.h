@@ -63,11 +63,15 @@ void get_property(const char *name, char *restrict output);
 
 void set_socket_create_context(const char *restrict context);
 
+bool set_socket_create_context_checked(const char *restrict context);
+
 bool unix_datagram_sendto(const char *restrict path, const void *restrict buf, size_t len);
 
 int chcon(const char *path, const char *restrict context);
 
 int unix_listener_from_path(const char *path);
+
+int unix_listener_from_path_checked_context(const char *path, const char *context);
 
 ssize_t write_fd(int fd, int sendfd);
 int read_fd(int fd);

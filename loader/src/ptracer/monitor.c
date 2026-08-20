@@ -478,7 +478,10 @@ static bool ensure_daemon_created(bool is_64bit) {
     char daemon_name[PATH_MAX] = "./bin/zygiskd";
     strcat(daemon_name, is_64bit ? "64" : "32");
 
-    execl(daemon_name, daemon_name, NULL);
+    if (domainless_monitor_active)
+      execl(daemon_name, daemon_name, "--apatch-domainless-v1", NULL);
+    else
+      execl(daemon_name, daemon_name, NULL);
 
     PLOGE("exec ReZygiskd%s failed", is_64bit ? "64" : "32");
 
