@@ -300,11 +300,16 @@ static void monitor_packet_append(uint8_t **cursor, const void *data, size_t siz
 static bool send_monitor_packet(bool apatch_domainless, const void *packet, size_t size) {
   if (!apatch_domainless) return unix_datagram_sendto(CONTROLLER_SOCKET, packet, size);
 
-  ssize_t sent = TEMP_FAILURE_RETRY(
-      send(REZYGISKD_DOMAINLESS_MONITOR_FD, packet, size, MSG_NOSIGNAL));
+  ssize_t sent;
+  do {
+    sent = send(REZYGISKD_DOMAINLESS_MONITOR_FD, packet, size, MSG_NOSIGNAL);
+  } while (sent == -1 && errno == EINTR);
   if (sent != (ssize_t)size) {
-    if (sent == -1) LOGE("send monitor packet: %s", strerror(errno));
-    else LOGE("short monitor packet: expected %zu, sent %zd", size, sent);
+    if (sent == -1) {
+      LOGE("send monitor packet: %s", strerror(errno));
+    } else {
+      LOGE("short monitor packet: expected %zu, sent %zd", size, sent);
+    }
     return false;
   }
   return true;
