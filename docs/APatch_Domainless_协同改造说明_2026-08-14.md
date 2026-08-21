@@ -1083,3 +1083,27 @@ daemon 延长 broker 生命周期。
 模块索引、companion、FD hiding、AP/KP wire、Vendor origin 10/service broker，也不增加 allow、permissive
 domain 或可枚举 abstract socket 名。按用户要求只提交源码，不运行测试或构建；runtime 状态仍待用户
 自行编译刷入后确认。
+
+## 9.36 最终真机收口：i27 正常，后续 claim 失败属于 APatch epoch 竞态
+
+用户完成 i27、KernelPatch d39 和 APatch 19157 刷入后的最终证据，确认 9.35 的匿名 daemon readiness
+通道正常工作：64/32 位 daemon 均完成 self claim 与注入，IRezygisk 状态项全部为 1，CkbSmartN 和
+IRezygisk Assistant 同时进入模块列表，Vendor 链路也出现 HAL PID 与 `TX_ACCEPTED`。
+
+i27 之后曾继续观察到的 64 位 `-EFAULT` 与 32 位 `-EPERM` 不是 ReZygisk socketpair、模块 ABI 或
+SELinux domain 回归。APatch 在 epoch 401 签发 ticket/broker 授权后，又在最终模块策略提交时推进到
+epoch 402，但 loader 已经提前 arm；旧 epoch claim 被内核拒绝，`-EFAULT` 只是无效 claim 落入 syscall
+伪装路径的外观。APatch 19157 把 inline/deferred 两条路径的 loader arm 都移到最终 policy epoch 之后，
+并在降级路径释放 held zygote，才是该阶段的最终修复。
+
+因此必须保留以下责任边界：
+
+- ReZygisk i27 负责无路径、无专用 permissive 域的 daemon readiness；
+- KernelPatch d39 负责 exact target/tracer generation、ptrace attach 与 `mm_access`；
+- APatch 19157 负责在最终 epoch 稳定后签发/启用 loader 授权；
+- Vendor 继续使用独立 origin 10/service preload broker，不为 IRezygisk 故障增加特判；
+- `Failed to read symbol fd` 等 CkbSmart 内部告警不能被重新解释为 IRezygisk 核心启动失败，也不能替代
+  CkbSmart 业务 Hook 的实际验收。
+
+本节把 i27 从“仅源码候选”提升为上述组合基线下的真机通过结论。按用户要求，本轮代码收口没有另跑
+整套自动化测试；目标 App 的业务功能与长期稳定性仍由用户实际使用验证。
