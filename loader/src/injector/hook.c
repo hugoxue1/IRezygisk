@@ -1195,8 +1195,13 @@ static void rz_run_modules_post(struct zygisk_context *ctx) {
   if (zygisk_module_length > 0)
     LOGD("Modules unloaded: %zu/%zu", modules_unloaded, zygisk_module_length);
 
-  if (!apatch_task_auth_end_callback(false)) {
-    LOGE("APatch failed to revoke the post-specialize authorization window");
+  /* system_server 在 post-specialize 之后仍需要 execmem 以支持 LSPlant/Dobby 等
+     模块的运行时代码修改（hook 系统服务）。普通 App 必须永久撤销 carrier——
+     不可信应用代码不得携带任何特权继续执行。 */
+  bool is_system_server = FLAG_GET(ctx, SERVER_FORK_AND_SPECIALIZE);
+  if (!apatch_task_auth_end_callback(is_system_server)) {
+    LOGE("APatch failed to close the post-specialize authorization window%s",
+         is_system_server ? " (system_server persistent grant)" : "");
     _exit(127);
   }
 }
