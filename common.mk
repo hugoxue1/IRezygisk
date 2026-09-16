@@ -4,8 +4,8 @@ API_LEVEL ?= 25
 ARCHS ?= arm64-v8a armeabi-v7a x86 x86_64
 ARCH ?= arm64-v8a
 
-VER_NAME ?= v1.0.0-i28
-VER_CODE ?= 565
+VER_NAME ?= v1.0.0-i29
+VER_CODE ?= 566
 COMMIT_HASH ?= $(shell git -C "$(ROOT_DIR)" rev-parse --verify --short HEAD 2>/dev/null || echo unknown)
 
 MIN_APATCH_VERSION ?= 10655
