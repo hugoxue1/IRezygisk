@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include <unistd.h> /* sleep */
+
 #include "../utils.h"
 #include "apatch.h"
 #include "kernelsu.h"
@@ -9,13 +11,35 @@ static struct root_impl impl;
 
 void root_impls_setup(void) {
   struct root_impl_state state_ksu;
-  ksu_get_existence(&state_ksu);
-
   struct root_impl_state state_apatch;
-  apatch_get_existence(&state_apatch);
-
   struct root_impl_state state_magisk;
-  magisk_get_existence(&state_magisk);
+
+  /* [CKB-MOD] Transient-detection retry: the manager swaps /data/adb/apd
+     during early boot and PATH/bin links may not be fully assembled when
+     the monitor launches us. A single-shot detection at that moment
+     misreads APatch as Inexistent/Abnormal, the daemon exits with
+     "Unknown root implementation", and the module stays unavailable
+     until the next zygote restart (observed in the field as intermittent
+     "IRezygisk unavailable" + CRC exposure windows). Retry with backoff
+     while nothing is Supported before concluding None. */
+  int attempt = 0;
+  for (;;) {
+    ksu_get_existence(&state_ksu);
+    apatch_get_existence(&state_apatch);
+    magisk_get_existence(&state_magisk);
+
+    int supported = (state_ksu.state == Supported ? 1 : 0) +
+                    (state_apatch.state == Supported ? 1 : 0) +
+                    (state_magisk.state == Supported ? 1 : 0);
+
+    if (supported >= 1 || attempt >= 10) break;
+
+    attempt++;
+
+    LOGW("Root implementation detection inconclusive (attempt %d/10), retrying in 1s", attempt);
+
+    sleep(1);
+  }
 
   /* INFO: Check if it's only one supported, if not, it's multile and that's bad.
             Remember that true here is equal to the integer 1. */
