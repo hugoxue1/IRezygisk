@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 
 #include <dlfcn.h>
 #include <android/dlext.h>
@@ -13,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 
 #include <unistd.h>
 
@@ -1034,17 +1036,83 @@ static bool load_modules_only(void) {
       LOGW("CSOLoader rejected module [%s]; retrying with Android linker", lib_path);
 
       int library_fd = ms.module_fds[i];
-      module->android_linker_path = strdup(lib_path);
+      /* [2026-10-18 07g-B] Restage the module into an anonymous memfd before
+         handing it to the Android linker. A /data/adb-backed fd makes the
+         linker map the module with a file-backed VMA whose pathname (and the
+         soinfo realpath fed to dl_iterate_phdr) exposes the module path in
+         every target process — observed live as
+         /data/adb/modules/zygisk_ckbsmart/zygisk/arm64-v8a.so x3 in a Soul
+         6.38.0 capture (docs 07g §一). Copying the bytes into a
+         memfd_create("jit-cache") gives the mapping the same anonymous
+         backing and display name as ART's own JIT regions, which appear in
+         every normal process. The path string passed to android_dlopen_ext is
+         set to the memfd name as well, so soinfo realpath matches /proc/maps
+         and no second channel leaks the original path. Failure here is
+         fail-open: staging is a stealth improvement, never a load-correctness
+         gate, so any error falls back to the original fd and path. */
+      int staged_fd = -1;
+      char staged_path[64];
+      if (library_fd >= 0) {
+        int mfd = (int)syscall(__NR_memfd_create, "jit-cache", 0);
+        if (mfd >= 0) {
+          if (lseek(library_fd, 0, SEEK_SET) == (off_t)-1) {
+            LOGW("Module fd rewind failed [%s]: %s", lib_path, strerror(errno));
+          }
+          char copy_buf[65536];
+          ssize_t rn;
+          bool copy_ok = true;
+          off_t total = 0;
+          while ((rn = read(library_fd, copy_buf, sizeof(copy_buf))) > 0) {
+            off_t wn_total = 0;
+            while (wn_total < rn) {
+              ssize_t wn = write(mfd, copy_buf + wn_total, (size_t)(rn - wn_total));
+              if (wn < 0) {
+                if (errno == EINTR) continue;
+                copy_ok = false;
+                break;
+              }
+              wn_total += wn;
+            }
+            if (!copy_ok) break;
+            total += rn;
+          }
+          if (rn < 0) copy_ok = false;
+          if (copy_ok && total > 0 && lseek(mfd, 0, SEEK_SET) == 0) {
+            staged_fd = mfd;
+            strncpy(staged_path, "/memfd:jit-cache", sizeof(staged_path) - 1);
+            staged_path[sizeof(staged_path) - 1] = '\0';
+            LOGI("Module [%s] restaged into memfd (%lld bytes)", lib_path, (long long)total);
+          } else {
+            if (!copy_ok || total <= 0)
+              LOGW("memfd staging failed for [%s]; using original fd (fail-open)", lib_path);
+            else
+              LOGW("memfd rewind failed for [%s]; using original fd (fail-open)", lib_path);
+            close(mfd);
+          }
+        } else {
+          LOGW("memfd_create unavailable; using original fd (fail-open) [%s]", lib_path);
+        }
+      }
+      const char *linker_path = staged_fd >= 0 ? staged_path : lib_path;
+      int linker_fd = staged_fd >= 0 ? staged_fd : library_fd;
+      module->android_linker_path = strdup(linker_path);
       if (!module->android_linker_path) {
         LOGE("Failed to retain Android linker module path [%s]", lib_path);
-      } else if (library_fd >= 0) {
+      } else if (linker_fd >= 0) {
         android_dlextinfo extinfo = {
           .flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD,
-          .library_fd = library_fd
+          .library_fd = linker_fd
         };
         module->android_linker_handle =
           android_dlopen_ext(module->android_linker_path,
                              RTLD_NOW | RTLD_LOCAL, &extinfo);
+      }
+
+      if (staged_fd >= 0) {
+        /* The kernel holds the mapping; the staged fd is only needed for the
+           dlopen call itself. Keep the original daemon fd untouched. */
+        close(staged_fd);
+        staged_fd = -1;
       }
 
       if (!module->android_linker_handle) {
