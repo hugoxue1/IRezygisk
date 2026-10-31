@@ -452,6 +452,21 @@ int rezygiskd_connect_companion(size_t index) {
   safe_write(write_size_t(fd, index), "companion index", return -1);
 
   if (domainless_session_fd >= 0) {
+    /* [2026-11-01 问候字节修复] companion 侧（zygiskd companion.c:154）在
+     * 派发模块 companion 线程前固定写 1 字节成功问候（write_uint8_t=1）。
+     * non-domainless 分支下方本就消费之；domainless 分支此前直接
+     * read_fd——问候字节滞留流首，read_fd 的 int32 帧计数被污染
+     * （0x100|size_msb），cmsg_len 校验拒绝真实 SCM_RIGHTS fd
+     * （215 号档 §十三：双内核上 engine memfd 通道恒败、"Failed to read
+     * symbol fd" 的机制根因）。此处与 non-domainless 分支对齐：先消费
+     * 问候并校验 ==1，再收 fd。 */
+    uint8_t res = 0;
+    safe_read(read_uint8_t(fd, &res), "companion socket result", return -1);
+    if (res != 1) {
+      rezygiskd_disconnect(fd);
+
+      return -1;
+    }
     int companion_fd = read_fd(fd);
     rezygiskd_disconnect(fd);
     return companion_fd;
